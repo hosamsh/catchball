@@ -1,0 +1,8 @@
+.samples/
+catchball-runs/
+*.md.done
+*.md.lock
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/

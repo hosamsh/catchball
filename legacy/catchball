@@ -1,0 +1,1476 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKER=""
+REVIEWER=""
+TASKS_DIR="./tasks"
+REVIEW_PASSES=3
+LOCK_STALE_TIMEOUT=10800
+LOCK_HEARTBEAT_INTERVAL=60
+ROLE_HEALTH_CHECK_INTERVAL=15
+ROLE_IDLE_TIMEOUT=600
+STATE_DIR=""
+RUNS_DIR=""
+ALLOW_DIRTY=0
+FROM_TASK=""
+WORKER_MODEL=""
+REVIEWER_MODEL=""
+WORKER_EFFORT=""
+REVIEWER_EFFORT=""
+WORKER_MODE=""
+REVIEWER_MODE=""
+declare -a WORKER_ARGS=()
+declare -a REVIEWER_ARGS=()
+declare -a TASKS=()
+# Add a new tool by declaring TOOL_<ANY_NAME> below.
+#
+# `spec` is a space-separated argv template.
+#
+# The first word in `spec` is the command to resolve and run.
+#
+# Literal words are passed through as-is.
+# `{{prompt}}`, `{{extra}}`, and `{{preset}}` are special placeholders.
+# Typed optional values use this form:
+#   [model:--model {value}:haiku|sonnet|opus]
+#
+# Role defaults are `key=value` pairs in `worker_defaults` or `reviewer_defaults`.
+# Example:
+#   declare -A TOOL_MYTOOL=(
+#     [spec]='mytool --model {{model}} {{extra}} {{prompt}}'
+#     [worker_defaults]='mode=acceptEdits'
+#   )
+declare -A TOOL_CLAUDE=(
+  [spec]='claude -p {{prompt}} [model:--model {value}:haiku|sonnet|opus] [effort:--effort {value}:low|medium|high] [mode:--permission-mode {value}:acceptEdits] {{extra}}'
+  [worker_defaults]='mode=acceptEdits'
+  [reviewer_defaults]='mode=acceptEdits'
+)
+declare -A TOOL_CODEX=(
+  [spec]='codex exec [model:--model {value}:gpt-5.3-codex] [effort:-c model_reasoning_effort={value}:low|medium|high] {{preset}} {{extra}} {{prompt}}'
+  [worker_preset]='--full-auto'
+  [reviewer_preset]='--sandbox workspace-write'
+)
+declare -A TOOL_COPILOT=(
+  [spec]='copilot --silent --no-ask-user --allow-all [model:--model {value}:gpt-5.2|gpt-5.4-mini] [effort:--reasoning-effort {value}:low|medium|high] {{preset}} {{extra}} -p {{prompt}}'
+  [worker_preset]='--autopilot'
+  [reviewer_preset]='--autopilot'
+)
+WORKER_PATH=""
+REVIEWER_PATH=""
+
+ROOT_DIR="$(pwd -P)"
+RUN_ID="$(date +%Y%m%d%H%M%S)-$$"
+RUN_FOLDER="$(date +%d-%m-%y--%H--%M--%S)--$$"
+HOST_NAME="$(hostname 2>/dev/null || printf 'unknown')"
+LOCK_OWNER="${USER:-${USERNAME:-unknown}}@${HOST_NAME}:$$"
+CURRENT_LOCK_FILE=""
+HEARTBEAT_PID=""
+CURRENT_ROLE_PID=""
+RUN_LOG=""
+RUN_RESULTS_DIR=""
+RUN_REVIEW_OUTPUTS_DIR=""
+REVIEWS_DIR=""
+
+main() {
+  parse_args "$@"
+  validate_configuration
+  initialize_state
+  discover_tasks
+  print_run_header
+  run_tasks
+  finish_run
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --worker)
+        set_option WORKER "$1" "${2:-}"
+        shift 2
+        ;;
+      --reviewer)
+        set_option REVIEWER "$1" "${2:-}"
+        shift 2
+        ;;
+      --tasks|--tasks-dir)
+        set_option TASKS_DIR "$1" "${2:-}"
+        shift 2
+        ;;
+      --from)
+        set_option FROM_TASK "$1" "${2:-}"
+        shift 2
+        ;;
+      --review-passes)
+        set_option REVIEW_PASSES "$1" "${2:-}"
+        shift 2
+        ;;
+      --retries)
+        require_value "$1" "${2:-}"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--retries must be a non-negative integer"
+        REVIEW_PASSES="$((10#$2 + 1))"
+        shift 2
+        ;;
+      --worker-model)
+        set_option WORKER_MODEL "$1" "${2:-}"
+        shift 2
+        ;;
+      --reviewer-model)
+        set_option REVIEWER_MODEL "$1" "${2:-}"
+        shift 2
+        ;;
+      --worker-effort)
+        set_option WORKER_EFFORT "$1" "${2:-}"
+        shift 2
+        ;;
+      --reviewer-effort)
+        set_option REVIEWER_EFFORT "$1" "${2:-}"
+        shift 2
+        ;;
+      --worker-mode)
+        set_option WORKER_MODE "$1" "${2:-}"
+        shift 2
+        ;;
+      --reviewer-mode)
+        set_option REVIEWER_MODE "$1" "${2:-}"
+        shift 2
+        ;;
+      --worker-arg)
+        append_role_arg worker "$1" "${2:-}"
+        shift 2
+        ;;
+      --reviewer-arg)
+        append_role_arg reviewer "$1" "${2:-}"
+        shift 2
+        ;;
+      --lock-timeout)
+        set_option LOCK_STALE_TIMEOUT "$1" "${2:-}"
+        shift 2
+        ;;
+      --lock-heartbeat)
+        set_option LOCK_HEARTBEAT_INTERVAL "$1" "${2:-}"
+        shift 2
+        ;;
+      --health-check-interval)
+        set_option ROLE_HEALTH_CHECK_INTERVAL "$1" "${2:-}"
+        shift 2
+        ;;
+      --idle-timeout)
+        set_option ROLE_IDLE_TIMEOUT "$1" "${2:-}"
+        shift 2
+        ;;
+      --runs-dir)
+        set_option RUNS_DIR "$1" "${2:-}"
+        shift 2
+        ;;
+      --state-dir)
+        set_option STATE_DIR "$1" "${2:-}"
+        shift 2
+        ;;
+      --allow-dirty|--allow-dirty-worktree)
+        ALLOW_DIRTY=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+validate_configuration() {
+  [[ -n "$WORKER" ]] || die "Both --worker and --reviewer are required"
+  [[ -n "$REVIEWER" ]] || die "Both --worker and --reviewer are required"
+  require_linux_host
+  require_positive_integer --review-passes "$REVIEW_PASSES"
+  require_positive_integer --lock-timeout "$LOCK_STALE_TIMEOUT"
+  require_positive_integer --lock-heartbeat "$LOCK_HEARTBEAT_INTERVAL"
+  require_positive_integer --health-check-interval "$ROLE_HEALTH_CHECK_INTERVAL"
+  require_positive_integer --idle-timeout "$ROLE_IDLE_TIMEOUT"
+  (( LOCK_HEARTBEAT_INTERVAL < LOCK_STALE_TIMEOUT )) || die "--lock-heartbeat must be smaller than --lock-timeout"
+  (( ROLE_HEALTH_CHECK_INTERVAL <= ROLE_IDLE_TIMEOUT )) || die "--health-check-interval must be smaller than or equal to --idle-timeout"
+
+  validate_role_tool worker "$WORKER"
+  validate_role_tool reviewer "$REVIEWER"
+  validate_role_settings worker
+  validate_role_settings reviewer
+
+  TASKS_DIR="$(abs_dir "$TASKS_DIR")"
+  [[ -z "$STATE_DIR" || -z "$RUNS_DIR" ]] || die "Use either --state-dir or --runs-dir, not both"
+}
+
+initialize_state() {
+  if [[ -n "$STATE_DIR" ]]; then
+    STATE_DIR="$(make_absolute_path "$STATE_DIR")"
+  else
+    if [[ -z "$RUNS_DIR" ]]; then
+      RUNS_DIR="$ROOT_DIR/catchball-runs"
+    else
+      RUNS_DIR="$(make_absolute_path "$RUNS_DIR")"
+    fi
+    STATE_DIR="$RUNS_DIR/$RUN_FOLDER"
+  fi
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && [[ "$ALLOW_DIRTY" -eq 0 ]]; then
+    [[ -z "$(git status --porcelain)" ]] || die "Working tree must be clean. Use --allow-dirty-worktree to override"
+  fi
+
+  RUN_LOG="$STATE_DIR/runs/$RUN_ID.log"
+  RUN_RESULTS_DIR="$STATE_DIR/results/$RUN_ID"
+  RUN_REVIEW_OUTPUTS_DIR="$STATE_DIR/reviewer-output/$RUN_ID"
+  REVIEWS_DIR="$STATE_DIR/reviews"
+  mkdir -p "$(dirname "$RUN_LOG")" "$RUN_RESULTS_DIR" "$RUN_REVIEW_OUTPUTS_DIR" "$REVIEWS_DIR"
+}
+
+discover_tasks() {
+  TASKS=()
+  while IFS= read -r -d '' task_file; do
+    TASKS+=("$task_file")
+  done < <(find "$TASKS_DIR" -type f -name '*.md' -print0 | sort -z)
+
+  [[ ${#TASKS[@]} -gt 0 ]] || die "No .md files in $TASKS_DIR"
+
+  START_INDEX=0
+  if [[ -n "$FROM_TASK" ]]; then
+    START_INDEX="$(find_start_index "$FROM_TASK")" || die "Start task not found: $FROM_TASK"
+  fi
+}
+
+print_run_header() {
+  printf 'catchball | worker: %s | reviewer: %s | tasks: %s | review-passes: %s\n' "$WORKER" "$REVIEWER" "${#TASKS[@]}" "$REVIEW_PASSES"
+  [[ -n "$FROM_TASK" ]] && printf 'catchball | from: %s\n' "$FROM_TASK"
+  printf 'catchball | run dir: %s\n' "$STATE_DIR"
+  printf 'catchball | health: %ss check | %ss idle-timeout\n' "$ROLE_HEALTH_CHECK_INTERVAL" "$ROLE_IDLE_TIMEOUT"
+  printf 'catchball | reviews: %s\n' "$REVIEWS_DIR"
+  printf 'catchball | run log: %s\n\n' "$RUN_LOG"
+
+  log_run RUN_START "-" "worker=$WORKER reviewer=$REVIEWER from=${FROM_TASK:-start} state_dir=$STATE_DIR health=$ROLE_HEALTH_CHECK_INTERVAL idle=$ROLE_IDLE_TIMEOUT"
+}
+
+run_tasks() {
+  PASSED=0
+  SKIPPED=0
+  STOPPED=0
+
+  for ((i = START_INDEX; i < ${#TASKS[@]}; i++)); do
+    task_file="${TASKS[$i]}"
+    rel_path="$(task_rel "$task_file")"
+    key="$(task_key "$task_file")"
+    active_review_file="$(review_file "$task_file")"
+
+    if [[ -f "$(done_file "$task_file")" ]]; then
+      printf 'SKIP_DONE %s\n' "$rel_path"
+      log_run SKIP_DONE "$rel_path"
+      SKIPPED=$((SKIPPED + 1))
+      continue
+    fi
+
+    if ! acquire_lock "$task_file" "$rel_path"; then
+      printf 'STOP_LOCKED %s\n' "$rel_path"
+      log_run STOP_LOCKED "$rel_path" "manual_intervention_required"
+      STOPPED=1
+      break
+    fi
+
+    ensure_parent_dir "$active_review_file"
+    cleanup_empty_file "$active_review_file"
+
+    worker_round=1
+    task_stopped=0
+
+    while :; do
+      if (( $(review_passes_used "$task_file") >= REVIEW_PASSES )); then
+        stop_review_exhausted "$rel_path"
+        break
+      fi
+
+      if active_review_exists "$active_review_file"; then
+        worker_prompt="$(worker_prompt_text "$task_file" "$active_review_file")"
+        printf 'RUN_FIX %s round %s\n' "$rel_path" "$worker_round"
+        log_run RUN_FIX "$rel_path" "round=$worker_round review=$active_review_file"
+      else
+        worker_prompt="$(worker_prompt_text "$task_file" "")"
+        printf 'RUN %s round %s\n' "$rel_path" "$worker_round"
+        log_run RUN "$rel_path" "round=$worker_round"
+      fi
+
+      worker_output_file="$RUN_RESULTS_DIR/${key}.worker-$worker_round.log"
+      if ! run_role_or_stop worker "$worker_prompt" "$worker_output_file" "$rel_path"; then
+        break
+      fi
+
+      previous_review_file=""
+      if active_review_exists "$active_review_file"; then
+        previous_review_file="$(archive_active_review "$task_file")"
+        log_run REVIEW_ARCHIVED "$rel_path" "file=$previous_review_file"
+      fi
+
+      review_pass="$(next_review_pass "$task_file")"
+      review_output_file="$RUN_REVIEW_OUTPUTS_DIR/${key}.review-$review_pass.log"
+      rm -f "$active_review_file"
+      reviewer_prompt="$(reviewer_prompt_text "$task_file" "$active_review_file" "$review_pass" "$previous_review_file")"
+      printf 'REVIEW %s pass %s/%s\n' "$rel_path" "$review_pass" "$REVIEW_PASSES"
+      log_run REVIEW "$rel_path" "pass=$review_pass"
+      if ! run_role_or_stop reviewer "$reviewer_prompt" "$review_output_file" "$rel_path"; then
+        break
+      fi
+
+      if ! active_review_exists "$active_review_file"; then
+        write_done "$task_file"
+        printf 'PASS %s\n' "$rel_path"
+        log_run PASS "$rel_path" "pass=$review_pass"
+        PASSED=$((PASSED + 1))
+        break
+      fi
+
+      printf 'REVIEW_FAIL %s pass %s/%s\n' "$rel_path" "$review_pass" "$REVIEW_PASSES"
+      log_run REVIEW_FAIL "$rel_path" "pass=$review_pass file=$active_review_file"
+      if (( review_pass >= REVIEW_PASSES )); then
+        stop_review_exhausted "$rel_path"
+        break
+      fi
+
+      worker_round=$((worker_round + 1))
+    done
+
+    release_lock
+
+    if [[ "$task_stopped" -eq 1 ]]; then
+      break
+    fi
+  done
+}
+
+finish_run() {
+  if [[ "$STOPPED" -eq 1 ]]; then
+    printf '\ndone | passed %s | skipped %s | stopped 1\n' "$PASSED" "$SKIPPED"
+    log_run RUN_STOP "-" "passed=$PASSED skipped=$SKIPPED"
+    exit 1
+  fi
+
+  printf '\ndone | passed %s | skipped %s | stopped 0\n' "$PASSED" "$SKIPPED"
+  log_run RUN_DONE "-" "passed=$PASSED skipped=$SKIPPED"
+  exit 0
+}
+
+stop_review_exhausted() {
+  local task_label="$1"
+  printf 'STOP_FAIL %s\n' "$task_label"
+  log_run STOP_FAIL "$task_label" "review_passes_exhausted"
+  mark_task_stopped
+}
+
+run_role_or_stop() {
+  local role="$1"
+  local prompt="$2"
+  local output_file="$3"
+  local task_label="$4"
+  local status
+
+  if run_role_to_file "$role" "$prompt" "$output_file" "$task_label"; then
+    return 0
+  fi
+
+  status=$?
+  handle_role_failure "$task_label" "$role" "$status" "$output_file"
+  mark_task_stopped
+  return "$status"
+}
+
+run_role_to_file() {
+  local role="$1"
+  local prompt="$2"
+  local output_file="$3"
+  local task_label="$4"
+  local pid
+  local last_activity_at
+  local last_output_state
+  local last_process_state
+  local current_output_state
+  local current_process_state
+  local output_changed
+  local process_changed
+  local health_status
+  local output_bytes
+  local idle_for
+  local idle_grace_used=0
+  local exit_code
+
+  ensure_parent_dir "$output_file"
+  : > "$output_file"
+  invoke_role "$role" "$prompt" >> "$output_file" 2>&1 &
+  pid=$!
+  CURRENT_ROLE_PID="$pid"
+  last_activity_at="$(now)"
+  last_output_state="$(file_size "$output_file"):$(file_mtime "$output_file")"
+  last_process_state="$(process_tree_signature "$pid" 2>/dev/null | tr '\n' '|' || true)"
+  log_run ROLE_START "$task_label" "role=$role pid=$pid file=$output_file"
+
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$ROLE_HEALTH_CHECK_INTERVAL"
+    current_output_state="$(file_size "$output_file"):$(file_mtime "$output_file")"
+    current_process_state="$(process_tree_signature "$pid" 2>/dev/null | tr '\n' '|' || true)"
+    output_changed=0
+    process_changed=0
+    [[ "$current_output_state" != "$last_output_state" ]] && output_changed=1
+    [[ "$current_process_state" != "$last_process_state" ]] && process_changed=1
+
+    if (( output_changed == 1 || process_changed == 1 )); then
+      last_activity_at="$(now)"
+      last_output_state="$current_output_state"
+      last_process_state="$current_process_state"
+      idle_grace_used=0
+      health_status="active"
+    else
+      health_status="idle"
+    fi
+
+    idle_for=$(( $(now) - last_activity_at ))
+    output_bytes="${current_output_state%%:*}"
+    log_run ROLE_HEALTH "$task_label" "role=$role pid=$pid status=$health_status idle=$idle_for output_changed=$output_changed process_changed=$process_changed bytes=$output_bytes"
+
+    if (( idle_for >= ROLE_IDLE_TIMEOUT )); then
+      if (( idle_grace_used == 0 )); then
+        idle_grace_used=1
+        last_activity_at="$(now)"
+        log_run ROLE_QUIET "$task_label" "role=$role pid=$pid idle=$idle_for grace=1 file=$output_file"
+        continue
+      fi
+
+      printf '\ncatchball | %s stalled after %ss without process or log activity\n' "$role" "$idle_for" >> "$output_file"
+      log_run ROLE_STALL "$task_label" "role=$role pid=$pid idle=$idle_for file=$output_file"
+      kill_process_tree "$pid"
+      wait "$pid" 2>/dev/null || true
+      CURRENT_ROLE_PID=""
+      return 124
+    fi
+  done
+
+  if wait "$pid"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+
+  CURRENT_ROLE_PID=""
+  log_run ROLE_EXIT "$task_label" "role=$role pid=$pid code=$exit_code file=$output_file"
+  return "$exit_code"
+}
+
+handle_role_failure() {
+  local task_label="$1"
+  local role="$2"
+  local status="$3"
+  local output_file="$4"
+
+  if (( status == 124 )); then
+    printf 'STOP_STALL %s\n' "$task_label"
+    log_run STOP_STALL "$task_label" "${role}_stalled file=$output_file"
+  else
+    printf 'STOP_ERROR %s\n' "$task_label"
+    log_run STOP_ERROR "$task_label" "${role}_failed code=$status file=$output_file"
+  fi
+}
+
+mark_task_stopped() {
+  STOPPED=1
+  task_stopped=1
+}
+
+worker_prompt_text() {
+  local task="$1"
+  local review="$2"
+
+  if [[ -n "$review" ]] && file_has_content "$review"; then
+    cat <<EOF
+Implement the task in $task.
+
+This task was already implemented. The latest review issues are in $review.
+Fix every issue in that file.
+
+Do not create, rename, or edit files under $REVIEWS_DIR.
+EOF
+  else
+    cat <<EOF
+Implement the task in $task.
+
+Do not create, rename, or edit files under $REVIEWS_DIR.
+EOF
+  fi
+}
+
+reviewer_prompt_text() {
+  local task="$1"
+  local review="$2"
+  local pass="$3"
+  local previous_review="$4"
+
+  cat <<EOF
+Review the implementation against the task in $task.
+
+Do not modify application code.
+Do not change the task file.
+If the implementation is clean, do not create $review.
+If there are issues, create exactly one non-empty file at $review and list only the issues that must be fixed.
+Write only to that file under $REVIEWS_DIR.
+This is review pass $pass.
+EOF
+
+  if [[ -n "$previous_review" ]]; then
+    cat <<EOF
+
+The previous resolved review comments are in $previous_review.
+Check whether they were addressed before writing a new review.
+EOF
+  fi
+}
+
+task_rel() {
+  printf '%s' "${1#$TASKS_DIR/}"
+}
+
+task_key() {
+  sanitize_name "$(task_rel "$1")"
+}
+
+done_file() {
+  printf '%s.done' "$1"
+}
+
+lock_file() {
+  printf '%s.lock' "$1"
+}
+
+review_file() {
+  printf '%s/%s.review' "$REVIEWS_DIR" "$(task_rel "$1")"
+}
+
+review_archive_prefix() {
+  printf '%s.done' "$(review_file "$1")"
+}
+
+ensure_parent_dir() {
+  mkdir -p "$(dirname "$1")"
+}
+
+cleanup_empty_file() {
+  local file="$1"
+
+  if [[ -f "$file" ]] && ! file_has_content "$file"; then
+    rm -f "$file"
+  fi
+}
+
+active_review_exists() {
+  local file="$1"
+  cleanup_empty_file "$file"
+  file_has_content "$file"
+}
+
+file_has_content() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  grep -q '[^[:space:]]' "$file"
+}
+
+latest_review_archive_index() {
+  local task="$1"
+  local prefix
+  local candidate
+  local suffix
+  local value
+  local max=0
+
+  prefix="$(review_archive_prefix "$task")"
+  for candidate in "$prefix".*; do
+    [[ -e "$candidate" ]] || continue
+    suffix="${candidate#$prefix.}"
+    [[ "$suffix" =~ ^[0-9]+$ ]] || continue
+    value=$((10#$suffix))
+    (( value > max )) && max=$value
+  done
+
+  printf '%s' "$max"
+}
+
+next_review_pass() {
+  local task="$1"
+  printf '%s' "$(( $(latest_review_archive_index "$task") + 1 ))"
+}
+
+review_passes_used() {
+  local task="$1"
+  local count
+
+  count="$(latest_review_archive_index "$task")"
+  if file_has_content "$(review_file "$task")"; then
+    count=$((count + 1))
+  fi
+
+  printf '%s' "$count"
+}
+
+archive_active_review() {
+  local task="$1"
+  local active
+  local archived
+  local index
+
+  active="$(review_file "$task")"
+  file_has_content "$active" || return 1
+  index="$(next_review_pass "$task")"
+  archived="$(review_archive_prefix "$task").$index"
+  ensure_parent_dir "$archived"
+  mv "$active" "$archived"
+  printf '%s' "$archived"
+}
+
+log_run() {
+  local event="$1"
+  local task="$2"
+  local message="${3:-}"
+  printf '%s %s %s %s\n' "$(timestamp)" "$event" "$task" "$message" >> "$RUN_LOG"
+}
+
+write_done() {
+  local task="$1"
+  local file
+
+  file="$(done_file "$task")"
+  {
+    printf 'run_id=%s\n' "$RUN_ID"
+    printf 'done_at=%s\n' "$(timestamp)"
+  } > "$file"
+}
+
+find_start_index() {
+  local target="$1"
+  local i
+  local rel
+  local base
+  local prefix_index=""
+  local prefix_count=0
+
+  for ((i = 0; i < ${#TASKS[@]}; i++)); do
+    rel="$(task_rel "${TASKS[$i]}")"
+    base="$(basename "${TASKS[$i]}")"
+    if [[ "$rel" == "$target" || "$base" == "$target" ]]; then
+      printf '%s' "$i"
+      return 0
+    fi
+
+    if [[ "$rel" == "$target"* || "$base" == "$target"* ]]; then
+      prefix_index="$i"
+      prefix_count=$((prefix_count + 1))
+    fi
+  done
+
+  if (( prefix_count == 1 )); then
+    printf '%s' "$prefix_index"
+    return 0
+  fi
+
+  if (( prefix_count > 1 )); then
+    die "Start task is ambiguous: $target"
+  fi
+
+  return 1
+}
+
+acquire_lock() {
+  local task="$1"
+  local rel="$2"
+  local file
+
+  file="$(lock_file "$task")"
+  while :; do
+    if ( set -o noclobber; : > "$file" ) 2>/dev/null; then
+      CURRENT_LOCK_FILE="$file"
+      write_lock "$file"
+      start_heartbeat "$file"
+      return 0
+    fi
+
+    [[ -f "$file" ]] || continue
+    if lock_is_stale "$file"; then
+      rm -f "$file"
+      printf 'STALE_LOCK_CLEARED %s\n' "$rel"
+      log_run STALE_LOCK_CLEARED "$rel"
+      continue
+    fi
+
+    return 1
+  done
+}
+
+write_lock() {
+  local file="$1"
+
+  {
+    printf 'run_id=%s\n' "$RUN_ID"
+    printf 'owner=%s\n' "$LOCK_OWNER"
+    printf 'host=%s\n' "$HOST_NAME"
+    printf 'pid=%s\n' "$$"
+    printf 'started_at=%s\n' "$(now)"
+  } > "$file"
+  touch "$file"
+}
+
+lock_is_stale() {
+  local file="$1"
+  local mtime
+
+  mtime="$(file_mtime "$file")"
+  [[ "$mtime" =~ ^[0-9]+$ ]] || return 0
+  (( $(now) - mtime > LOCK_STALE_TIMEOUT )) || return 1
+  lock_holder_is_alive "$file" && return 1
+  return 0
+}
+
+start_heartbeat() {
+  local file="$1"
+
+  stop_heartbeat
+  (
+    while :; do
+      sleep "$LOCK_HEARTBEAT_INTERVAL"
+      touch "$file" 2>/dev/null || exit 0
+    done
+  ) &
+  HEARTBEAT_PID=$!
+}
+
+stop_heartbeat() {
+  if [[ -n "$HEARTBEAT_PID" ]]; then
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+    HEARTBEAT_PID=""
+  fi
+}
+
+release_lock() {
+  stop_heartbeat
+  if [[ -n "$CURRENT_LOCK_FILE" ]]; then
+    rm -f "$CURRENT_LOCK_FILE"
+    CURRENT_LOCK_FILE=""
+  fi
+}
+
+stop_role_process() {
+  if [[ -n "$CURRENT_ROLE_PID" ]]; then
+    kill_process_tree "$CURRENT_ROLE_PID"
+    wait "$CURRENT_ROLE_PID" 2>/dev/null || true
+    CURRENT_ROLE_PID=""
+  fi
+}
+
+cleanup() {
+  stop_role_process
+  release_lock
+}
+
+handle_interrupt() {
+  trap - EXIT
+  cleanup
+  exit 130
+}
+
+handle_terminate() {
+  trap - EXIT
+  cleanup
+  exit 143
+}
+
+trap cleanup EXIT
+trap handle_interrupt INT
+trap handle_terminate TERM
+
+process_tree_signature() {
+  local root="$1"
+  local pid
+  local time_field
+  local state_field
+  local -a lines=()
+
+  while IFS= read -r pid; do
+    time_field="$(ps -o time= -p "$pid" 2>/dev/null | tr -d '\r')"
+    time_field="$(trim "$time_field")"
+    state_field="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '\r')"
+    state_field="$(trim "$state_field")"
+    [[ -n "$time_field$state_field" ]] || continue
+    lines+=("$pid:$time_field:$state_field")
+  done < <(process_tree_pids "$root")
+
+  (( ${#lines[@]} > 0 )) || return 1
+  printf '%s\n' "${lines[@]}" | sort
+}
+
+process_tree_pids() {
+  local root="$1"
+  local current
+  local child
+  local -a queue=("$root")
+  local -A seen=()
+
+  while (( ${#queue[@]} > 0 )); do
+    current="${queue[0]}"
+    queue=("${queue[@]:1}")
+    [[ -n "$current" ]] || continue
+    [[ -z ${seen[$current]:-} ]] || continue
+    seen["$current"]=1
+    printf '%s\n' "$current"
+    while IFS= read -r child; do
+      child="$(trim "$child")"
+      [[ -n "$child" ]] || continue
+      queue+=("$child")
+    done < <(ps -o pid= --ppid "$current" 2>/dev/null || true)
+  done
+}
+
+kill_process_tree() {
+  local root="$1"
+  local pid
+  local index
+  local -a pids=()
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(process_tree_pids "$root")
+
+  for ((index = ${#pids[@]} - 1; index >= 0; index--)); do
+    kill "${pids[$index]}" 2>/dev/null || true
+  done
+  sleep 1
+  for ((index = ${#pids[@]} - 1; index >= 0; index--)); do
+    kill -0 "${pids[$index]}" 2>/dev/null || continue
+    kill -9 "${pids[$index]}" 2>/dev/null || true
+  done
+}
+
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0'
+}
+
+file_size() {
+  local file="$1"
+  [[ -f "$file" ]] || {
+    printf '0'
+    return 0
+  }
+  wc -c < "$file" | tr -d '[:space:]'
+}
+
+invoke_role() {
+  local role="$1"
+  local prompt="$2"
+  local tool
+  local model
+  local effort
+  local mode
+  local -a cmd=()
+  local -a extra=()
+
+  load_role_settings "$role" tool model effort mode extra
+  render_tool_command cmd "$tool" "$role" "$prompt" "$model" "$effort" "$mode" "${extra[@]}"
+  run_role_binary "$role" "${cmd[@]}"
+}
+
+render_tool_command() {
+  local target_name="$1"
+  local -n out_args="$target_name"
+  local tool="$2"
+  local role="$3"
+  local prompt="$4"
+  local model="$5"
+  local effort="$6"
+  local mode="$7"
+  shift 7
+  local spec
+  local token
+  local token_kind
+  local render_text
+  local allowed_values
+  local value
+  local preset_text
+  local resolved_model
+  local resolved_effort
+  local resolved_mode
+  local -a parts=()
+
+  spec="$(tool_get "$tool" spec)"
+  [[ -n "$spec" ]] || die "No spec for $tool"
+
+  resolved_model="$(resolve_role_value "$tool" "$role" model "$model")"
+  resolved_effort="$(resolve_role_value "$tool" "$role" effort "$effort")"
+  resolved_mode="$(resolve_role_value "$tool" "$role" mode "$mode")"
+  preset_text="$(tool_get "$tool" "$(preset_key_for_role "$role")")"
+
+  split_spec_parts "$spec" parts
+  (( ${#parts[@]} > 0 )) || die "No command in spec for $tool"
+
+  for token in "${parts[@]:1}"; do
+    case "$token" in
+      '{{prompt}}')
+        out_args+=("$prompt")
+        ;;
+      '{{extra}}')
+        out_args+=("$@")
+        ;;
+      '{{preset}}')
+        append_words "$target_name" "$preset_text"
+        ;;
+      *)
+        if is_spec_choice "$token"; then
+          parse_spec_choice "$token" token_kind render_text allowed_values
+          case "$token_kind" in
+            model) value="$resolved_model" ;;
+            effort) value="$resolved_effort" ;;
+            mode) value="$resolved_mode" ;;
+            *) die "Unknown tool spec kind: $token_kind" ;;
+          esac
+          [[ -n "$value" ]] || continue
+          validate_supported_value "$tool" "$token_kind" "$value" "$allowed_values"
+          append_words "$target_name" "${render_text//\{value\}/$value}"
+        else
+          out_args+=("$token")
+        fi
+        ;;
+    esac
+  done
+}
+
+validate_role_settings() {
+  local role="$1"
+  local tool
+  local model
+  local effort
+  local mode
+  local resolved_model
+  local resolved_effort
+  local resolved_mode
+
+  load_role_settings "$role" tool model effort mode
+  resolved_model="$(resolve_role_value "$tool" "$role" model "$model")"
+  resolved_effort="$(resolve_role_value "$tool" "$role" effort "$effort")"
+  resolved_mode="$(resolve_role_value "$tool" "$role" mode "$mode")"
+
+  validate_role_value "$tool" model "$model" "$resolved_model"
+  validate_role_value "$tool" effort "$effort" "$resolved_effort"
+  validate_role_value "$tool" mode "$mode" "$resolved_mode"
+}
+
+validate_role_value() {
+  local tool="$1"
+  local kind="$2"
+  local explicit_value="$3"
+  local resolved_value="$4"
+  local allowed_values
+
+  [[ -n "$explicit_value" || -n "$resolved_value" ]] || return 0
+  allowed_values="$(tool_kind_values "$tool" "$kind" || true)"
+  [[ -n "$allowed_values" ]] || die "Unsupported $kind for $tool: $resolved_value"
+  validate_supported_value "$tool" "$kind" "$resolved_value" "$allowed_values"
+}
+
+load_role_settings() {
+  local role="$1"
+  local tool_name="$2"
+  local model_name="$3"
+  local effort_name="$4"
+  local mode_name="$5"
+  local args_name="${6:-}"
+
+  local -n tool_ref="$tool_name"
+  local -n model_ref="$model_name"
+  local -n effort_ref="$effort_name"
+  local -n mode_ref="$mode_name"
+
+  tool_ref="$(role_get "$role" tool)"
+  model_ref="$(role_get "$role" model)"
+  effort_ref="$(role_get "$role" effort)"
+  mode_ref="$(role_get "$role" mode)"
+
+  [[ -n "$args_name" ]] || return 0
+  role_copy_args "$args_name" "$role"
+}
+
+validate_role_tool() {
+  local role="$1"
+  local tool="$2"
+
+  tool_get "$tool" spec >/dev/null || die "Unknown tool: $tool"
+  resolve_tool_for_role "$role" "$tool" || die "Required tool not found on PATH: $tool"
+}
+
+resolve_tool_for_role() {
+  local role="$1"
+  local tool="$2"
+  local command_name
+  local spec
+  local path_var
+
+  path_var="$(role_var_name "$role" path)"
+
+  local -n path_ref="$path_var"
+
+  [[ -n "$path_ref" ]] && return 0
+
+  spec="$(tool_get "$tool" spec)"
+  [[ -n "$spec" ]] || return 1
+  command_name="$(tool_name_from_spec "$spec")"
+  path_ref="$(command -v "$command_name" 2>/dev/null)" || return 1
+}
+
+run_role_binary() {
+  local role="$1"
+  shift
+  local path
+
+  path="$(role_get "$role" path)"
+  [[ -n "$path" ]] || die "Tool path not resolved for $role"
+  "$path" "$@"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./catchball --worker <tool> --reviewer <tool> [options]
+
+Options:
+  --tasks, --tasks-dir <dir>
+  --from <task>
+  --review-passes <n>
+  --worker-model <value>    provider-native model value
+  --reviewer-model <value>  provider-native model value
+  --worker-effort <value>   provider-native effort value
+  --reviewer-effort <value> provider-native effort value
+  --worker-mode <value>     provider-native mode value
+  --reviewer-mode <value>   provider-native mode value
+  --worker-arg <arg>
+  --reviewer-arg <arg>
+  --lock-timeout <seconds>
+  --lock-heartbeat <seconds>
+  --health-check-interval <seconds>
+  --idle-timeout <seconds>
+  --runs-dir <dir>
+  --state-dir <dir>
+  --allow-dirty, --allow-dirty-worktree
+  --help
+
+Runtime:
+  Bash on Linux or WSL only
+  Tools must be on this shell's PATH
+EOF
+
+  printf '\nTools:\n'
+  print_tool_names
+}
+
+print_tool_names() {
+  local var_name
+  local spec
+
+  while IFS= read -r var_name; do
+    [[ -n "$var_name" ]] || continue
+    spec="$(tool_spec_for_var "$var_name")"
+    [[ -n "$spec" ]] || continue
+    printf '  %s\n' "$(tool_name_from_spec "$spec")"
+  done < <(compgen -A variable TOOL_)
+}
+
+tool_get() {
+  local tool="$1"
+  local key="$2"
+  local config_var
+
+  config_var="$(find_tool_var "$tool")" || return 1
+
+  local -n config="$config_var"
+  printf '%s' "${config[$key]:-}"
+}
+
+find_tool_var() {
+  local wanted_name="$1"
+  local var_name
+  local spec
+
+  while IFS= read -r var_name; do
+    [[ -n "$var_name" ]] || continue
+    spec="$(tool_spec_for_var "$var_name")"
+    [[ -n "$spec" ]] || continue
+    if [[ "$(tool_name_from_spec "$spec")" == "$wanted_name" ]]; then
+      printf '%s' "$var_name"
+      return 0
+    fi
+  done < <(compgen -A variable TOOL_)
+
+  return 1
+}
+
+tool_spec_for_var() {
+  local var_name="$1"
+  local -n config="$var_name"
+  printf '%s' "${config[spec]:-}"
+}
+
+tool_name_from_spec() {
+  local spec="$1"
+  printf '%s' "${spec%% *}"
+}
+
+tool_kind_values() {
+  local tool="$1"
+  local kind="$2"
+  local spec
+  local token
+  local token_kind
+  local render_text
+  local values
+  local -a parts=()
+
+  spec="$(tool_get "$tool" spec)"
+  [[ -n "$spec" ]] || return 1
+
+  split_spec_parts "$spec" parts
+  for token in "${parts[@]}"; do
+    is_spec_choice "$token" || continue
+    parse_spec_choice "$token" token_kind render_text values
+    if [[ "$token_kind" == "$kind" ]]; then
+      printf '%s' "$values"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_role_value() {
+  local tool="$1"
+  local role="$2"
+  local kind="$3"
+  local explicit_value="$4"
+  local default_value
+
+  if [[ -n "$explicit_value" ]]; then
+    printf '%s' "$explicit_value"
+    return 0
+  fi
+
+  default_value="$(tool_default_value "$tool" "$role" "$kind" || true)"
+  printf '%s' "$default_value"
+}
+
+tool_default_value() {
+  local tool="$1"
+  local role="$2"
+  local kind="$3"
+  local defaults
+  local item
+  local -a items=()
+
+  defaults="$(tool_get "$tool" "$(defaults_key_for_role "$role")")"
+  [[ -n "$defaults" ]] || return 1
+
+  read -r -a items <<< "$defaults"
+  for item in "${items[@]}"; do
+    if [[ "$item" == "$kind="* ]]; then
+      printf '%s' "${item#*=}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+defaults_key_for_role() {
+  if [[ "$1" == worker ]]; then
+    printf 'worker_defaults'
+  else
+    printf 'reviewer_defaults'
+  fi
+}
+
+preset_key_for_role() {
+  if [[ "$1" == worker ]]; then
+    printf 'worker_preset'
+  else
+    printf 'reviewer_preset'
+  fi
+}
+
+split_spec_parts() {
+  local spec="$1"
+  local target_name="$2"
+  local -n target_ref="$target_name"
+  local current=""
+  local char
+  local depth=0
+  local i
+
+  for ((i = 0; i < ${#spec}; i++)); do
+    char="${spec:i:1}"
+    case "$char" in
+      '[')
+        if (( depth == 0 )) && [[ -n "$current" ]]; then
+          target_ref+=("$current")
+          current=""
+        fi
+        current+="$char"
+        depth=$((depth + 1))
+        ;;
+      ']')
+        current+="$char"
+        if (( depth > 0 )); then
+          depth=$((depth - 1))
+        fi
+        if (( depth == 0 )); then
+          target_ref+=("$current")
+          current=""
+        fi
+        ;;
+      ' ' | $'\t')
+        if (( depth > 0 )); then
+          current+="$char"
+        elif [[ -n "$current" ]]; then
+          target_ref+=("$current")
+          current=""
+        fi
+        ;;
+      *)
+        current+="$char"
+        ;;
+    esac
+  done
+
+  [[ -n "$current" ]] && target_ref+=("$current")
+}
+
+is_spec_choice() {
+  [[ "$1" == \[*\] ]]
+}
+
+parse_spec_choice() {
+  local token="$1"
+  local kind_name="$2"
+  local render_name="$3"
+  local values_name="$4"
+  local -n kind_ref="$kind_name"
+  local -n render_ref="$render_name"
+  local -n values_ref="$values_name"
+  local inner
+  local parsed_kind
+  local rest
+  local parsed_render
+  local parsed_values
+
+  inner="${token:1:${#token}-2}"
+  parsed_kind="${inner%%:*}"
+  rest="${inner#*:}"
+  parsed_render="${rest%:*}"
+  parsed_values="${rest##*:}"
+
+  [[ -n "$parsed_kind" && "$rest" != "$inner" && "$parsed_render" != "$rest" ]] || die "Invalid tool spec token: $token"
+
+  kind_ref="$parsed_kind"
+  render_ref="$parsed_render"
+  values_ref="${parsed_values//|/$'\n'}"
+}
+
+# Utilities
+
+append_role_arg() {
+  local role="$1"
+  local option="$2"
+  local value="$3"
+  local args_name
+
+  require_value "$option" "$value"
+  args_name="$(role_var_name "$role" args)"
+
+  local -n args_ref="$args_name"
+  args_ref+=("$value")
+}
+
+set_option() {
+  local target="$1"
+  local option="$2"
+  local value="$3"
+  require_value "$option" "$value"
+  printf -v "$target" '%s' "$value"
+}
+
+role_var_name() {
+  local role="$1"
+  local field="$2"
+  local prefix
+
+  case "$role" in
+    worker) prefix="WORKER" ;;
+    reviewer) prefix="REVIEWER" ;;
+    *) die "Unknown role: $role" ;;
+  esac
+
+  case "$field" in
+    tool) printf '%s' "$prefix" ;;
+    model|effort|mode|path) printf '%s_%s' "$prefix" "${field^^}" ;;
+    args) printf '%s_ARGS' "$prefix" ;;
+    *) die "Unknown role field: $field" ;;
+  esac
+}
+
+role_get() {
+  local var_name
+  var_name="$(role_var_name "$1" "$2")"
+
+  local -n value_ref="$var_name"
+  printf '%s' "$value_ref"
+}
+
+role_copy_args() {
+  local target_name="$1"
+  local role="$2"
+  local source_name
+  local -n target_ref="$target_name"
+
+  source_name="$(role_var_name "$role" args)"
+
+  local -n source_ref="$source_name"
+  target_ref=("${source_ref[@]}")
+}
+
+lock_file_value() {
+  local file="$1"
+  local wanted_key="$2"
+  local key
+  local value
+
+  [[ -f "$file" ]] || return 1
+  while IFS='=' read -r key value; do
+    [[ "$key" == "$wanted_key" ]] || continue
+    printf '%s' "$value"
+    return 0
+  done < "$file"
+
+  return 1
+}
+
+lock_holder_is_alive() {
+  local file="$1"
+  local pid
+  local host
+  local owner
+
+  pid="$(lock_file_value "$file" pid || true)"
+  host="$(lock_file_value "$file" host || true)"
+
+  if [[ -z "$host" ]]; then
+    owner="$(lock_file_value "$file" owner || true)"
+    [[ -n "$owner" ]] || return 1
+    host="${owner#*@}"
+    host="${host%%:*}"
+  fi
+
+  [[ "$host" == "$HOST_NAME" ]] || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+append_words() {
+  local target_name="$1"
+  local -n target_ref="$target_name"
+  local text="$2"
+  local -a words=()
+
+  [[ -n "$text" ]] || return 0
+  read -r -a words <<< "$text"
+  (( ${#words[@]} > 0 )) || return 0
+  target_ref+=("${words[@]}")
+}
+
+text_list_contains() {
+  local text="$1"
+  local wanted="$2"
+  local item
+
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    [[ "$item" == "$wanted" ]] && return 0
+  done <<< "$text"
+
+  return 1
+}
+
+validate_supported_value() {
+  local tool="$1"
+  local kind="$2"
+  local value="$3"
+  local supported_text="$4"
+
+  [[ -n "$value" ]] || return 0
+  [[ -n "$supported_text" ]] || return 0
+  text_list_contains "$supported_text" "$value" && return 0
+  die "Unsupported $kind for $tool: $value"
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+abs_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || die "Tasks directory not found: $dir"
+  (
+    cd "$dir"
+    pwd -P
+  )
+}
+
+sanitize_name() {
+  printf '%s' "$1" | sed -E 's#\\#/#g; s#/#-#g; s/[[:space:]]+/-/g; s/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
+}
+
+make_absolute_path() {
+  local path="$1"
+  case "$path" in
+    /*) printf '%s' "$path" ;;
+    *) printf '%s/%s' "$ROOT_DIR" "$path" ;;
+  esac
+}
+
+now() {
+  date +%s
+}
+
+timestamp() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+require_linux_host() {
+  local kernel_name
+  kernel_name="$(uname -s 2>/dev/null || true)"
+  [[ "$kernel_name" == Linux ]] || die "catchball requires Bash on Linux or WSL"
+}
+
+require_value() {
+  [[ $# -eq 2 ]] || die "Missing value for $1"
+  [[ -n ${2:-} ]] || die "Missing value for $1"
+  [[ ${2:-} != --* ]] || die "Missing value for $1"
+}
+
+require_positive_integer() {
+  local option="$1"
+  local value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$option must be a positive integer"
+  (( value > 0 )) || die "$option must be greater than zero"
+}
+
+main "$@"

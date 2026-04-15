@@ -6,9 +6,8 @@ Run catchball over your tasklist. One agent implements, another reviews.
 ```bash
 uv run catchball --worker claude --reviewer codex
 
-uv run catchball --worker copilot --reviewer claude --worker-model gpt-4.1 --reviewer-model haiku
+uv run catchball --worker copilot --reviewer claude --worker-model gpt-5.4 --reviewer-model opus
 
-uv run catchball --worker claude --reviewer codex --review-passes 5
 ```
 
 ## How it works

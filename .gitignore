@@ -1,5 +1,6 @@
 .samples/
 catchball-runs/
+catchball-state/
 *.md.done
 *.md.lock
 __pycache__/

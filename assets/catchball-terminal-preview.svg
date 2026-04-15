@@ -1,0 +1,51 @@
+<svg width="1040" height="690" viewBox="0 0 1040 690" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">catchball preview</title>
+  <desc id="desc">A terminal-style preview of catchball output showing three tasks, one review and fix loop, and the final summary line.</desc>
+  <defs>
+    <linearGradient id="bg" x1="40" y1="32" x2="1000" y2="658" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0F172A"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" x="0" y="0" width="1040" height="690" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#020617" flood-opacity="0.30"/>
+    </filter>
+  </defs>
+
+  <rect width="1040" height="690" rx="28" fill="#F8FAFC"/>
+  <g filter="url(#shadow)">
+    <rect x="40" y="32" width="960" height="626" rx="24" fill="url(#bg)"/>
+  </g>
+
+  <rect x="40" y="32" width="960" height="56" rx="24" fill="#1E293B"/>
+  <circle cx="78" cy="60" r="8" fill="#FB7185"/>
+  <circle cx="104" cy="60" r="8" fill="#FBBF24"/>
+  <circle cx="130" cy="60" r="8" fill="#4ADE80"/>
+  <text x="520" y="67" text-anchor="middle" font-family="Consolas, Menlo, Monaco, monospace" font-size="20" font-weight="700" fill="#CBD5E1">catchball</text>
+
+  <g font-family="Consolas, Menlo, Monaco, monospace" font-size="18" font-weight="700">
+    <text x="74" y="118" fill="#22D3EE">◉ task:</text>
+    <text x="198" y="118" fill="#E2E8F0">010-setup.md</text>
+    <text x="106" y="148" fill="#60A5FA">◆ worker (copilot - round 1)</text>
+    <text x="106" y="178" fill="#FBBF24">◇ reviewer (claude - pass 1/3)</text>
+    <text x="138" y="208" fill="#F87171">✗ issues found</text>
+    <text x="106" y="238" fill="#4ADE80">◆ fixer (codex - round 2)</text>
+    <text x="106" y="268" fill="#FBBF24">◇ reviewer (claude - pass 2/3)</text>
+    <text x="138" y="298" fill="#4ADE80">✓ clean -&gt; done</text>
+
+    <text x="74" y="344" fill="#22D3EE">◉ task:</text>
+    <text x="198" y="344" fill="#E2E8F0">020-build.md</text>
+    <text x="106" y="374" fill="#60A5FA">◆ worker (copilot - round 1)</text>
+    <text x="106" y="404" fill="#FBBF24">◇ reviewer (claude - pass 1/3)</text>
+    <text x="138" y="434" fill="#4ADE80">✓ clean -&gt; done</text>
+
+    <text x="74" y="480" fill="#22D3EE">◉ task:</text>
+    <text x="198" y="480" fill="#E2E8F0">030-tests.md</text>
+    <text x="106" y="510" fill="#60A5FA">◆ worker (copilot - round 1)</text>
+    <text x="106" y="540" fill="#FBBF24">◇ reviewer (claude - pass 1/3)</text>
+    <text x="138" y="570" fill="#4ADE80">✓ clean -&gt; done</text>
+  </g>
+
+  <rect x="64" y="602" width="912" height="18" rx="9" fill="#1E293B" opacity="0.9"/>
+  <text x="74" y="615" font-family="Consolas, Menlo, Monaco, monospace" font-size="16" font-weight="700" fill="#22D3EE">◆ done |</text>
+  <text x="150" y="615" font-family="Consolas, Menlo, Monaco, monospace" font-size="16" font-weight="700" fill="#CBD5E1">total 3 | passed-clean 2 | passed-review 1 | failed 0 | skipped 0 | stopped 0</text>
+</svg>

@@ -1,116 +1,162 @@
 # catchball
-Mix Claude, Codex, and Copilot instead of betting everything on one coding agent.
-
-Run catchball over your tasklist. One agent implements, another reviews.
-
-```bash
-uv run catchball --worker claude --reviewer codex
-
-uv run catchball --worker copilot --reviewer claude --worker-model gpt-5.4 --reviewer-model opus
-
-```
+Many folks are already splitting work across agents and harnesses, one writes code, another reviews it. catchball runs that loop for you by throwing your tasks at Claude, Codex, and/or Copilot and keeping things going until the code is clean.
 
 ## How it works
-Tasks live by default in `./tasks`. Name them in execution order, like:
+Put your tasks in `./tasks`, named in execution order. For example:
 
 - `010-setup.md`
 - `020-build.md`
 - `030-tests.md`
 
-catchball stays strictly sequential inside one task list. The worker does the task. The reviewer checks it. If the reviewer leaves no active review file, the task passes. If the reviewer raises issues, the task goes back for fixes. Each run gets its own logs and artifacts.
+ask catchball to coordinate the work:
 
-## Install prerequisites
+```bash
+uv run catchball --worker copilot --reviewer claude --fixer codex
+```
 
-- Python 3.11+: https://www.python.org/downloads/
-- `uv`: https://docs.astral.sh/uv/getting-started/installation/
-- At least one coding agent cli on your `PATH`
-- Claude Code: https://docs.anthropic.com/en/docs/claude-code/overview
-- OpenAI Codex: https://developers.openai.com/codex/
-- GitHub Copilot: https://docs.github.com/en/copilot
+catchball runs tasks in order. The worker codes, the reviewer checks, and if anything comes back, the fixer (or the worker, if no fixer is set) handles the fix round.
+
+<img src="assets/catchball-terminal-preview.svg" alt="Terminal-style preview of a catchball run" width="860" />
+
+## Prerequisites
+- Python 3.11+ — https://www.python.org/downloads/
+- `uv` — https://docs.astral.sh/uv/getting-started/installation/
+- At least one agent CLI on your `PATH`:
+    - [Claude Code](https://code.claude.com/docs/en/overview)
+    - [OpenAI Codex](https://developers.openai.com/codex/cli)
+    - [GitHub Copilot](https://github.com/features/copilot/cli)
+
+## Quick start
+Clone and run:
+
+```bash
+uv run catchball --worker claude --reviewer codex
+```
+
+To install `catchball` as a standalone command:
+
+```bash
+uv tool install .
+catchball --worker claude --reviewer codex
+```
+
+To run against a project in a different folder:
+
+```bash
+catchball --project-root ../my-app --worker claude --reviewer codex
+```
+
+Agents run inside `project-root` and pick up any existing harness automatically (`AGENTS.md`, `CLAUDE.md`, etc.)
 
 ## FAQ
 
-### Can I point it at another task folder?
+### What tools are supported?
+Claude Code, OpenAI Codex, and GitHub Copilot. You can use one for everything or mix and match as you wish.
 
-Yep.
+### What goes in a task file?
+Plain markdown. Describe what you want built, fixed, or changed. catchball attaches the task file path to the worker as the prompt. One clear goal per file works best.
 
-```bash
-uv run catchball --worker claude --reviewer codex --tasks ./packages/api/tasks
-```
+### How does the review loop work?
+Worker runs first, then the reviewer. If the reviewer finds nothing to flag, the task passes. If it writes issues to a `.review` file, the fixer (or worker) gets a fix round. This repeats up to `--review-passes` times (default 3).
 
-### Can I start from task 020 or 030?
-
-Yep. Use `--from`.
-
-```bash
-uv run catchball --worker claude --reviewer codex --from 020-build.md
-```
-
-### Can I provide custom instruction files for the agents?
-
-Yep.
+### How do I pick a model?
+Use `--worker-model`, `--reviewer-model`, or `--fixer-model`:
 
 ```bash
-uv run catchball --worker claude --reviewer codex --worker-instructions ./WORKER.md --reviewer-instructions ./REVIEWER.md
-```
-
-If `WORKER.md` and `REVIEWER.md` already exist at repo root, catchball picks them up automatically.
-
-### How does the review round work?
-
-Worker runs first. Reviewer runs after that. If the reviewer creates no active `.review` file, the task passes. If it creates a non-empty one under `reviews/`, the next worker round becomes a fix round. Older issue sets get archived as `.review.done.`.
-
-### How can I change the number of review rounds?
-
-Use `--review-passes`. Default is `3`.
-
-```bash
-uv run catchball --worker claude --reviewer codex --review-passes 5
+catchball --worker claude --worker-model opus --reviewer codex --reviewer-model gpt-5.4
 ```
 
 ### Can I set the effort level?
-
-Yep, if the selected tools support it.
+If the tool supports it:
 
 ```bash
-uv run catchball --worker claude --reviewer codex --worker-effort high --reviewer-effort medium
+catchball --worker claude --reviewer codex --worker-effort high --reviewer-effort medium
 ```
+
+
+### Can I provide custom instruction files?
+Use `--worker-instructions`, or `--reviewer-instructions`:
+
+```bash
+catchball --worker claude --reviewer codex --worker-instructions ./WORKER.md --reviewer-instructions ./REVIEWER.md
+```
+
+If add `WORKER.md` or `REVIEWER.md` exist at repo root, catchball picks them up automatically.
+
+### Can I add a dedicated fixer?
+`--fixer` is optional. When set, fix rounds use that agent instead of the worker.
+
+```bash
+catchball --worker copilot --fixer codex --reviewer claude
+```
+
+If `FIXER.md` exists at repo root, catchball picks it up. Otherwise it uses `WORKER.md` as guidance.
+
+### Can I run catchball from outside the target repo?
+Yes, but set the `--project-root`:
+
+```bash
+catchball --project-root ../my-app --worker claude --reviewer codex
+```
+
+Agent CLIs run in that folder and relative paths like `./tasks` resolve from there.
+
+### Can I use a different task folder?
+```bash
+catchball --worker claude --reviewer codex --tasks ./packages/api/tasks
+```
+
+### Can I start from a specific task?
+Use `--from`:
+
+```bash
+catchball --worker claude --reviewer codex --from 020-build.md
+```
+
+### Can I change the number of review rounds?
+Use `--review-passes`:
+
+```bash
+catchball --worker claude --reviewer codex --review-passes 5
+```
+
+### What happens when a task fails to clean after exhausing the review passes?
+catchball marks it with a `.failed` sidecar and stops the whole opertion. Use `--continue-despite-failures` to keep moving on to next tasks instead.
+
+### Can I rerun a task list?
+Tasks with a `.done` marker in `catchball-state/` are skipped on reruns. Failed tasks get `.failed` instead and they are retried again next time.
+
+For a completely fresh start, use `--reset-state` or delete the state folder:
+
+```bash
+catchball --worker claude --reviewer codex --reset-state
+```
+
+### Can I pass extra arguments to a tool?
+Use `--worker-arg`, `--fixer-arg`, or `--reviewer-arg`:
+
+```bash
+catchball --worker claude --reviewer codex --worker-arg "--dangerously-skip-permissions"
+```
+
+### Can I add a delay between phases?
+Use `--phase-delay` to wait a bit before handing over to or from the reviewer:
+
+```bash
+catchball --worker claude --reviewer codex --phase-delay 3
+```
+
+### Can I run tasks in parallel?
+catchball is strictly sequential inside one task list. If some tasks are independent, split them into separate folders and run in separate terminals.
 
 ### What does `--allow-dirty-worktree` do?
-
-By default catchball wants a clean git worktree before it starts. This flag skips that check and lets you run against uncommitted changes.
+catchball wants a clean git worktree before starting. This flag skips that check.
 
 ### What are these lock files?
+They live under `<tasks-dir>/catchball-state/` and prevent two runs from working the same task. Stale locks are cleared automatically.
 
-`*.md.lock` means a task is currently claimed by a catchball run. A fresh lock stops the run at that task. Stale lock are cleared after the timeout window.
+### Where do the logs go?
+Under `<active-root>/catchball-runs/<timestamp>/` — each run gets a log file, worker output, reviewer output, and reviews. Use `--state-dir` to override.
 
-### Can I run multiple ranges in parallel if there are no dependencies?
-
-That is on you.
-
-If task `010` and task `050` really do not depend on each other, split them into separate task folders or run from different starting points in separate terminals. catchball itself stays strictly sequential inside one task list.
-
-### Where do the logs go now?
-
-Inside the run folder:
-
-- `<run-id>.log`
-- `worker-output/`
-- `reviewer-output/`
-- `reviews/`
-
-### Can I keep rerunning the same task list?
-
-Yep. `.done` files are the skip marker. For a real fresh regeneration, remove the `*.md.done` sidecars first.
-
-### Can I keep one exact output folder instead of getting a fresh timestamped one every time?
-
-Yep.
-
-```bash
-uv run catchball --worker claude --reviewer codex --state-dir ./tmp/catchball-run
-```
-
-### Can I use the legacy bash runner?
-
-Advise not. `legacy/` is there for historical reference. Use the Python runner.
+### Is this another Ralph Wiggum?
+Same spirit, more structure. catchball is a role-based multi-agent coding loop with fixed implement, review, and fix stages.

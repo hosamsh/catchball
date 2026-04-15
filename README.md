@@ -27,13 +27,22 @@ catchball runs tasks in order. The worker codes, the reviewer checks, and if any
     - [GitHub Copilot](https://github.com/features/copilot/cli)
 
 ## Quick start
-Clone and run:
+Run from a local checkout:
 
 ```bash
+git clone https://github.com/hosamsh/catchball.git
+cd catchball
 uv run catchball --worker claude --reviewer codex
 ```
 
-To install `catchball` as a standalone command:
+To install `catchball` directly from GitHub as a standalone command:
+
+```bash
+uv tool install git+https://github.com/hosamsh/catchball.git
+catchball --worker claude --reviewer codex
+```
+
+If you already cloned the repo and want the same standalone command from this checkout:
 
 ```bash
 uv tool install .

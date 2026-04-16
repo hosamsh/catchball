@@ -50,7 +50,7 @@ declare -A TOOL_CODEX=(
   [reviewer_preset]='--sandbox workspace-write'
 )
 declare -A TOOL_COPILOT=(
-  [spec]='copilot --silent --no-ask-user --allow-all [model:--model {value}:gpt-5.2|gpt-5.4-mini] [effort:--reasoning-effort {value}:low|medium|high] {{preset}} {{extra}} -p {{prompt}}'
+  [spec]='copilot --no-ask-user --allow-all [model:--model {value}:gpt-5.2|gpt-5.4-mini] [effort:--reasoning-effort {value}:low|medium|high] {{preset}} {{extra}} -p {{prompt}}'
   [worker_preset]='--autopilot'
   [reviewer_preset]='--autopilot'
 )

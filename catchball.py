@@ -148,8 +148,8 @@ TOOLS: dict[str, ToolConfig] = {
     "claude": ToolConfig(
         spec=(
             "claude -p {{prompt}} "
-            "[model:--model {value}:haiku|sonnet|opus|claude-haiku-4-5|claude-sonnet-4-6|claude-opus-4-6] "
-            "[effort:--effort {value}:low|medium|high|max] "
+            "[model:--model {value}:haiku|sonnet|opus|claude-haiku-4-5|claude-sonnet-4-6|claude-opus-4-6|claude-opus-4-7] "
+            "[effort:--effort {value}:low|medium|high|xhigh|max] "
             "[mode:--permission-mode {value}:acceptEdits] {{extra}}"
         ),
         worker_defaults={"mode": "acceptEdits"},
@@ -167,8 +167,8 @@ TOOLS: dict[str, ToolConfig] = {
     ),
     "copilot": ToolConfig(
         spec=(
-            "copilot --silent --no-ask-user --allow-all "
-            "[model:--model {value}:gpt-5.4|gpt-5.3-Codex|gpt-5.2-Codex|gpt-5.2|gpt-5.1|gpt-5.4-mini|gpt-5-mini|gpt-4.1|claude-sonnet-4.6|claude-sonnet-4.5|claude-haiku-4.5|claude-opus-4.6|claude-opus-4.5|claude-sonnet-4] "
+            "copilot --no-ask-user --allow-all "
+            "[model:--model {value}:gpt-5.4|gpt-5.3-Codex|gpt-5.2-Codex|gpt-5.2|gpt-5.1|gpt-5.4-mini|gpt-5-mini|gpt-4.1|claude-sonnet-4.6|claude-sonnet-4.5|claude-haiku-4.5|claude-opus-4.7|claude-opus-4.6|claude-opus-4.5|claude-sonnet-4] "
             "[effort:--reasoning-effort {value}:low|medium|high|xhigh] "
             "{{preset}} {{extra}} -p {{prompt}}"
         ),

@@ -1,22 +1,23 @@
 # catchball
-Many folks are already splitting work across agents and harnesses, one writes code, another reviews it. catchball runs that loop for you by throwing your tasks at Claude, Codex, and/or Copilot and keeping things going until the code is clean.
+Don't bounce between Codex, Claude and Copilot.
 
-## How it works
-Put your tasks in `./tasks`, named in execution order. For example:
+Put tasks under ./tasks, run catchball, and it handles the implement → review → fix loop until everything is clean.
 
-- `010-setup.md`
-- `020-build.md`
-- `030-tests.md`
+For example, say you created these tasks in the tasks folder:
 
-ask catchball to coordinate the work:
+- `010-setup.md`, 
+- `020-build.md`, 
+- `030-tests.md` .
+
+Then ask catchball to coordinate the work:
 
 ```bash
 uv run catchball --worker copilot --reviewer claude --fixer codex
 ```
-
-catchball runs tasks in order. The worker codes, the reviewer checks, and if anything comes back, the fixer (or the worker, if no fixer is set) handles the fix round.
-
 <img src="assets/catchball-terminal-preview.svg" alt="Terminal-style preview of a catchball run" width="860" />
+
+Each task runs through this loop until it passes or fails.
+
 
 ## Prerequisites
 - Python 3.11+ — https://www.python.org/downloads/
@@ -81,7 +82,6 @@ If the tool supports it:
 ```bash
 catchball --worker claude --reviewer codex --worker-effort high --reviewer-effort medium
 ```
-
 
 ### Can I provide custom instruction files?
 Use `--worker-instructions`, or `--reviewer-instructions`:

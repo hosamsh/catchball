@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -96,6 +97,7 @@ class ToolConfig:
     reviewer_defaults: dict[str, str] = field(default_factory=dict)
     worker_preset: str = ""
     reviewer_preset: str = ""
+    stream_json_filter: bool = False
 
     def defaults_for(self, role_name: str) -> dict[str, str]:
         if role_name == "reviewer":
@@ -130,7 +132,7 @@ class AppSettings:
     phase_delay_seconds: int = 0
     lock_stale_timeout: int = 10800
     lock_heartbeat_interval: int = 60
-    role_health_check_interval: int = 15
+    role_health_check_interval: int = 30
     role_idle_timeout: int = 600
     state_dir: Path | None = None
     allow_dirty: bool = False
@@ -147,13 +149,14 @@ ROLE_KINDS = ("model", "effort", "mode")
 TOOLS: dict[str, ToolConfig] = {
     "claude": ToolConfig(
         spec=(
-            "claude -p {{prompt}} "
+            "claude -p --verbose --output-format stream-json --include-partial-messages {{prompt}} "
             "[model:--model {value}:haiku|sonnet|opus|claude-haiku-4-5|claude-sonnet-4-6|claude-opus-4-6|claude-opus-4-7] "
             "[effort:--effort {value}:low|medium|high|xhigh|max] "
             "[mode:--permission-mode {value}:acceptEdits] {{extra}}"
         ),
         worker_defaults={"mode": "acceptEdits"},
         reviewer_defaults={"mode": "acceptEdits"},
+        stream_json_filter=True,
     ),
     "codex": ToolConfig(
         spec=(
@@ -522,6 +525,7 @@ class CatchballRunner:
 
             task_stopped = False
             had_review_issues = False
+            pre_task_dirty: frozenset[str] = self.git_dirty_files()
             try:
                 self.ensure_parent_dir(active_review_file)
                 self.cleanup_empty_file(active_review_file)
@@ -538,6 +542,7 @@ class CatchballRunner:
                         implementation_role,
                         task_file,
                         active_review_file if has_review else None,
+                        diff_stat=self.git_diff_stat(pre_task_dirty) if has_review else "",
                     )
                     event = "RUN_FIX" if has_review else "RUN"
                     detail = f"round={implementation_round} role={implementation_role}"
@@ -578,6 +583,7 @@ class CatchballRunner:
                         active_review_file,
                         review_pass,
                         previous_review_file,
+                        diff_stat=self.git_diff_stat(pre_task_dirty),
                     )
                     self.report(
                         f"REVIEW {rel_path} pass {review_pass}/{self.settings.review_passes}",
@@ -763,7 +769,7 @@ class CatchballRunner:
             73: ("STOP_BLOCKED", f"{role_name}_write_blocked"),
         }.get(status, ("STOP_ERROR", f"{role_name}_failed"))
 
-    def implementation_prompt_text(self, role_name: str, task: Path, review: Path | None) -> str:
+    def implementation_prompt_text(self, role_name: str, task: Path, review: Path | None, diff_stat: str = "") -> str:
         if review is not None and self.file_has_content(review):
             lines = [
                 f"This task was already implemented. The latest review issues are in {review}.",
@@ -772,13 +778,15 @@ class CatchballRunner:
                 "Do not re-implement the task from scratch unless a review issue requires it.",
                 "",
             ]
+            if diff_stat:
+                lines.extend(("Changed files so far (git diff HEAD --stat):", diff_stat, ""))
         else:
             lines = [f"Implement the task in {task}.", ""]
         lines.extend(self.role_instruction_lines(role_name))
         lines.append(f"Do not create, rename, or edit files under {self.reviews_dir}.")
         return "\n".join(lines) + "\n"
 
-    def reviewer_prompt_text(self, task: Path, review: Path, review_pass: int, previous_review: Path | None) -> str:
+    def reviewer_prompt_text(self, task: Path, review: Path, review_pass: int, previous_review: Path | None, diff_stat: str = "") -> str:
         lines = [
             f"Review the implementation against the task in {task}.",
             "",
@@ -789,6 +797,8 @@ class CatchballRunner:
             f"Write only to that file under {self.reviews_dir}.",
             f"This is review pass {review_pass}.",
         ]
+        if diff_stat:
+            lines.extend(("", "Changed files (git diff HEAD --stat):", diff_stat))
         lines.extend(self.role_instruction_lines("reviewer"))
         if previous_review is not None:
             lines.extend(("", f"The previous resolved review comments are in {previous_review}.", "Check whether they were addressed before writing a new review."))
@@ -1059,6 +1069,24 @@ class CatchballRunner:
         role = self.role_settings(role_name)
         command_args = self.render_tool_command(role_name, role, prompt)
         launch_command = self.prepare_launch_command(role.binary_path, command_args)
+        tool_config = TOOLS[role.tool]
+        if tool_config.stream_json_filter:
+            with output_file.open("ab") as stderr_handle:
+                proc = subprocess.Popen(
+                    launch_command,
+                    cwd=self.root_dir,
+                    env=self.env,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_handle,
+                    stdin=subprocess.DEVNULL,
+                )
+            thread = threading.Thread(
+                target=self._stream_json_filter_thread,
+                args=(proc, output_file),
+                daemon=True,
+            )
+            thread.start()
+            return proc
         with output_file.open("ab") as handle:
             return subprocess.Popen(
                 launch_command,
@@ -1068,6 +1096,29 @@ class CatchballRunner:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
             )
+
+    def _stream_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
+        with output_file.open("ab") as f:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if event.get("type") != "stream_event":
+                    continue
+                inner = event.get("event", {})
+                if inner.get("type") != "content_block_delta":
+                    continue
+                delta = inner.get("delta", {})
+                if delta.get("type") != "text_delta":
+                    continue
+                text = delta.get("text", "")
+                if text:
+                    f.write(text.encode("utf-8", errors="replace"))
+                    f.flush()
 
     def render_tool_command(self, role_name: str, role: RoleSettings, prompt: str) -> list[str]:
         tool_config = TOOLS[role.tool]
@@ -1642,6 +1693,32 @@ class CatchballRunner:
     def is_git_worktree_clean(self) -> bool:
         result = self._git("status", "--porcelain")
         return result is None or not result.stdout.strip()
+
+    def git_dirty_files(self) -> frozenset[str]:
+        result = self._git("diff", "HEAD", "--name-only")
+        if result is None or result.returncode != 0:
+            return frozenset()
+        return frozenset(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+    def git_diff_stat(self, exclude: frozenset[str] = frozenset()) -> str:
+        result = self._git("diff", "HEAD", "--stat")
+        if result is None or result.returncode != 0:
+            return ""
+        if not exclude:
+            return result.stdout.strip()
+        # Keep only lines that mention a file not in the pre-task baseline.
+        # The summary line (e.g. "3 files changed, ...") is unconditionally excluded
+        # and recomputed from the kept lines — but generating a new summary is complex,
+        # so we just drop it and return the per-file lines only.
+        kept: list[str] = []
+        for line in result.stdout.splitlines():
+            # Per-file lines look like " path/to/file | 12 +++---"
+            if "|" not in line:
+                continue
+            file_part = line.split("|")[0].strip()
+            if file_part not in exclude:
+                kept.append(line)
+        return "\n".join(kept)
 
 
 def install_signal_handlers(runner: CatchballRunner) -> callable:

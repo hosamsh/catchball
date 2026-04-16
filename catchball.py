@@ -70,6 +70,9 @@ ASCII_GLYPHS = ConsoleGlyphs(
     stale="~",
 )
 
+UNICODE_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+ASCII_SPINNER_FRAMES = ("-", "\\", "|", "/")
+
 ANSI_RESET = "\033[0m"
 ANSI_STYLES = {
     "task": "\033[1;36m",
@@ -327,6 +330,9 @@ class CatchballRunner:
         self.stderr = stderr or sys.stderr
         self.console_glyphs = self.choose_console_glyphs()
         self.console_color = self.choose_console_color()
+        self.console_live_status = self.choose_console_live_status()
+        self.live_status_width = 0
+        self.live_status_index = 0
         self.run_id = datetime.now().strftime("%Y%m%d%H%M%S") + f"-{os.getpid()}"
         self.run_folder = datetime.now().strftime("%d-%m-%y--%H--%M--%S") + f"--{os.getpid()}"
         self.host_name = socket.gethostname() or "unknown"
@@ -686,57 +692,63 @@ class CatchballRunner:
 
         self.current_role_process = process
         last_activity_at = self.now()
+        started_at = last_activity_at
         last_output_state = self.output_state(output_file)
         last_process_state = self.process_tree_signature(process.pid)
         self.log_run("ROLE_START", task_label, f"role={role_name} pid={process.pid} file={output_file}")
         idle_grace_used = False
+        self.emit_role_health_status(role_name, "starting", started_at, 0, last_output_state[0])
 
-        while process.poll() is None:
-            time.sleep(self.settings.role_health_check_interval)
-            current_output_state = self.output_state(output_file)
-            current_process_state = self.process_tree_signature(process.pid)
-            output_changed = int(current_output_state != last_output_state)
-            process_changed = int(current_process_state != last_process_state)
+        try:
+            while process.poll() is None:
+                time.sleep(self.settings.role_health_check_interval)
+                current_output_state = self.output_state(output_file)
+                current_process_state = self.process_tree_signature(process.pid)
+                output_changed = int(current_output_state != last_output_state)
+                process_changed = int(current_process_state != last_process_state)
 
-            if output_changed or process_changed:
-                last_activity_at = self.now()
-                last_output_state = current_output_state
-                last_process_state = current_process_state
-                idle_grace_used = False
-                health_status = "active"
-            else:
-                health_status = "idle"
-
-            idle_for = self.now() - last_activity_at
-            output_bytes = current_output_state[0]
-            self.log_run(
-                "ROLE_HEALTH",
-                task_label,
-                "role="
-                f"{role_name} pid={process.pid} status={health_status} idle={idle_for} "
-                f"output_changed={output_changed} process_changed={process_changed} "
-                f"bytes={output_bytes}",
-            )
-
-            if idle_for >= self.settings.role_idle_timeout:
-                if not idle_grace_used:
-                    idle_grace_used = True
+                if output_changed or process_changed:
                     last_activity_at = self.now()
-                    self.log_run("ROLE_QUIET", task_label, f"role={role_name} pid={process.pid} idle={idle_for} grace=1 file={output_file}")
-                    continue
+                    last_output_state = current_output_state
+                    last_process_state = current_process_state
+                    idle_grace_used = False
+                    health_status = "active"
+                else:
+                    health_status = "idle"
 
-                self.append_text(output_file, f"\ncatchball | {role_name} stalled after {idle_for}s without process or log activity\n")
-                self.log_run("ROLE_STALL", task_label, f"role={role_name} pid={process.pid} idle={idle_for} file={output_file}")
-                self.terminate_process(process)
-                return 124
+                idle_for = self.now() - last_activity_at
+                output_bytes = current_output_state[0]
+                self.log_run(
+                    "ROLE_HEALTH",
+                    task_label,
+                    "role="
+                    f"{role_name} pid={process.pid} status={health_status} idle={idle_for} "
+                    f"output_changed={output_changed} process_changed={process_changed} "
+                    f"bytes={output_bytes}",
+                )
+                self.emit_role_health_status(role_name, health_status, started_at, idle_for, output_bytes)
 
-        exit_code = process.wait()
-        self.current_role_process = None
-        self.log_run("ROLE_EXIT", task_label, f"role={role_name} pid={process.pid} code={exit_code} file={output_file}")
-        if exit_code == 0 and self.role_output_is_write_blocked(output_file):
-            self.log_run("ROLE_BLOCKED", task_label, f"role={role_name} file={output_file}")
-            return 73
-        return exit_code
+                if idle_for >= self.settings.role_idle_timeout:
+                    if not idle_grace_used:
+                        idle_grace_used = True
+                        last_activity_at = self.now()
+                        self.log_run("ROLE_QUIET", task_label, f"role={role_name} pid={process.pid} idle={idle_for} grace=1 file={output_file}")
+                        continue
+
+                    self.append_text(output_file, f"\ncatchball | {role_name} stalled after {idle_for}s without process or log activity\n")
+                    self.log_run("ROLE_STALL", task_label, f"role={role_name} pid={process.pid} idle={idle_for} file={output_file}")
+                    self.terminate_process(process)
+                    return 124
+
+            exit_code = process.wait()
+            self.current_role_process = None
+            self.log_run("ROLE_EXIT", task_label, f"role={role_name} pid={process.pid} code={exit_code} file={output_file}")
+            if exit_code == 0 and self.role_output_is_write_blocked(output_file):
+                self.log_run("ROLE_BLOCKED", task_label, f"role={role_name} file={output_file}")
+                return 73
+            return exit_code
+        finally:
+            self.clear_live_status()
 
     def handle_role_failure(self, task_label: str, role_name: str, status: int, output_file: Path) -> None:
         event, reason = self.role_failure_details(role_name, status)
@@ -987,6 +999,7 @@ class CatchballRunner:
     def cleanup(self) -> None:
         self.stop_role_process()
         self.release_lock()
+        self.clear_live_status()
 
     def process_tree(self, root_pid: int) -> list[psutil.Process]:
         try:
@@ -1505,6 +1518,12 @@ class CatchballRunner:
             or term_name.startswith(("xterm", "screen", "tmux", "vt100", "cygwin"))
         )
 
+    def choose_console_live_status(self) -> bool:
+        is_tty = getattr(self.stdout, "isatty", None)
+        if not callable(is_tty) or not is_tty():
+            return False
+        return self.env.get("TERM", "").lower() != "dumb"
+
     def colorize(self, style_name: str, text: str) -> str:
         if not self.console_color:
             return text
@@ -1513,7 +1532,60 @@ class CatchballRunner:
             return text
         return f"{style}{text}{ANSI_RESET}"
 
+    def spinner_frame(self) -> str:
+        frames = ASCII_SPINNER_FRAMES if self.console_glyphs is ASCII_GLYPHS else UNICODE_SPINNER_FRAMES
+        frame = frames[self.live_status_index % len(frames)]
+        self.live_status_index += 1
+        return frame
+
+    def format_bytes(self, byte_count: int) -> str:
+        units = ("B", "KB", "MB", "GB")
+        value = float(byte_count)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(value)} {unit}"
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{int(byte_count)} B"
+
+    def emit_live_status(self, message: str) -> None:
+        if not self.console_live_status:
+            return
+        self.live_status_width = max(self.live_status_width, len(message))
+        self.stdout.write("\r" + message.ljust(self.live_status_width))
+        self.stdout.flush()
+
+    def clear_live_status(self) -> None:
+        if not self.console_live_status or self.live_status_width <= 0:
+            return
+        self.stdout.write("\r" + (" " * self.live_status_width) + "\r")
+        self.stdout.flush()
+        self.live_status_width = 0
+
+    def role_health_activity_text(self, health_status: str, idle_for: int, output_bytes: int) -> str:
+        if health_status == "starting":
+            return "starting"
+        if health_status == "active":
+            return "doing work"
+        if output_bytes == 0:
+            return f"waiting on first model response ({idle_for}s quiet)"
+        if idle_for < max(self.settings.role_health_check_interval * 2, 30):
+            return f"waiting on model response ({idle_for}s quiet)"
+        return f"still waiting on model response ({idle_for}s quiet)"
+
+    def emit_role_health_status(self, role_name: str, health_status: str, started_at: int, idle_for: int, output_bytes: int) -> None:
+        if not self.console_live_status:
+            return
+        role_tool = self.role_tool_name(role_name)
+        elapsed = max(0, self.now() - started_at)
+        activity = self.role_health_activity_text(health_status, idle_for, output_bytes)
+        self.emit_live_status(
+            f"{self.spinner_frame()} {role_name} ({role_tool}) health ok | alive {elapsed}s | {activity} | {self.format_bytes(output_bytes)} log"
+        )
+
     def emit(self, message: str = "") -> None:
+        self.clear_live_status()
         print(message, file=self.stdout, flush=True)
 
     def append_text(self, file_path: Path, text: str) -> None:

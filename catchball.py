@@ -764,15 +764,16 @@ class CatchballRunner:
         }.get(status, ("STOP_ERROR", f"{role_name}_failed"))
 
     def implementation_prompt_text(self, role_name: str, task: Path, review: Path | None) -> str:
-        lines = [f"Implement the task in {task}.", ""]
         if review is not None and self.file_has_content(review):
-            lines.extend(
-                (
-                    f"This task was already implemented. The latest review issues are in {review}.",
-                    "Fix every issue in that file.",
-                    "",
-                )
-            )
+            lines = [
+                f"This task was already implemented. The latest review issues are in {review}.",
+                "Start by reading that file and fix every issue listed there.",
+                f"Use {task} only as the source of truth for the intended outcome.",
+                "Do not re-implement the task from scratch unless a review issue requires it.",
+                "",
+            ]
+        else:
+            lines = [f"Implement the task in {task}.", ""]
         lines.extend(self.role_instruction_lines(role_name))
         lines.append(f"Do not create, rename, or edit files under {self.reviews_dir}.")
         return "\n".join(lines) + "\n"

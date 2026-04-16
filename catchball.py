@@ -149,7 +149,7 @@ TOOLS: dict[str, ToolConfig] = {
         spec=(
             "claude -p {{prompt}} "
             "[model:--model {value}:haiku|sonnet|opus|claude-haiku-4-5|claude-sonnet-4-6|claude-opus-4-6] "
-            "[effort:--effort {value}:low|medium|high] "
+            "[effort:--effort {value}:low|medium|high|max] "
             "[mode:--permission-mode {value}:acceptEdits] {{extra}}"
         ),
         worker_defaults={"mode": "acceptEdits"},
@@ -159,7 +159,7 @@ TOOLS: dict[str, ToolConfig] = {
         spec=(
             "codex exec "
             "[model:--model {value}:gpt-5.4|gpt-5.4-mini|gpt-5.3-codex|gpt-5.3-codex-spark|gpt-5.2] "
-            "[effort:-c model_reasoning_effort={value}:low|medium|high] "
+            "[effort:-c model_reasoning_effort={value}:low|medium|high|xhigh] "
             "{{preset}} {{extra}} {{prompt}}"
         ),
         worker_preset="--full-auto",
@@ -169,7 +169,7 @@ TOOLS: dict[str, ToolConfig] = {
         spec=(
             "copilot --silent --no-ask-user --allow-all "
             "[model:--model {value}:gpt-5.4|gpt-5.3-Codex|gpt-5.2-Codex|gpt-5.2|gpt-5.1|gpt-5.4-mini|gpt-5-mini|gpt-4.1|claude-sonnet-4.6|claude-sonnet-4.5|claude-haiku-4.5|claude-opus-4.6|claude-opus-4.5|claude-sonnet-4] "
-            "[effort:--reasoning-effort {value}:low|medium|high] "
+            "[effort:--reasoning-effort {value}:low|medium|high|xhigh] "
             "{{preset}} {{extra}} -p {{prompt}}"
         ),
         worker_preset="--autopilot",

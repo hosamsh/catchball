@@ -149,11 +149,13 @@ catchball --worker claude --reviewer codex --worker-arg "--dangerously-skip-perm
 ```
 
 ### Can I add a delay between phases?
-Use `--phase-delay` to wait a bit before handing over to or from the reviewer:
+Yes. `--phase-delay` now defaults to `3`, and the same delay is also applied between completed tasks. Set it to `0` if you want to disable the pause entirely:
 
 ```bash
-catchball --worker claude --reviewer codex --phase-delay 3
+catchball --worker claude --reviewer codex --phase-delay 0
 ```
+
+Each completed task also emits a timing summary line with total time plus worker, fixer, reviewer, and delay totals.
 
 ### Can I run tasks in parallel?
 catchball is strictly sequential inside one task list. If some tasks are independent, split them into separate folders and run in separate terminals.

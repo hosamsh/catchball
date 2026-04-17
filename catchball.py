@@ -15,17 +15,19 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Sequence
+from typing import IO, Callable, Sequence
 
 import psutil
 
 NON_WHITESPACE_RE = re.compile(r"\S")
+ROLE_PERMISSION_SIGNAL_RE = re.compile(r"^permission denied (?P<target>.+)$", re.IGNORECASE)
 ROLE_WRITE_BLOCK_RE = re.compile(
-    r"Failed to write file|Access to the path .* is denied|Permission denied|Unable to create '.+index\.lock'",
+    r"^(?:Failed to write file\b.*|Access to the path .* is denied|Unable to create '.+index\.lock'|(?:error|fatal): .*?(?:write|save|create|index\.lock).*Permission denied)$",
     re.IGNORECASE,
 )
 WINDOWS_BATCH_SUFFIXES = {".bat", ".cmd"}
 LOCK_PROCESS_START_TOLERANCE_SECONDS = 5
+LIVE_STATUS_REFRESH_SECONDS = 0.1
 ROLE_NAMES = ("worker", "fixer", "reviewer")
 REQUIRED_ROLE_NAMES = ("worker", "reviewer")
 
@@ -97,7 +99,7 @@ class ToolConfig:
     reviewer_defaults: dict[str, str] = field(default_factory=dict)
     worker_preset: str = ""
     reviewer_preset: str = ""
-    stream_json_filter: bool = False
+    output_filter: str = ""
 
     def defaults_for(self, role_name: str) -> dict[str, str]:
         if role_name == "reviewer":
@@ -129,7 +131,7 @@ class AppSettings:
     review_passes: int = 3
     continue_despite_failures: bool = False
     reset_state: bool = False
-    phase_delay_seconds: int = 0
+    phase_delay_seconds: int = 3
     lock_stale_timeout: int = 10800
     lock_heartbeat_interval: int = 60
     role_health_check_interval: int = 30
@@ -156,27 +158,29 @@ TOOLS: dict[str, ToolConfig] = {
         ),
         worker_defaults={"mode": "acceptEdits"},
         reviewer_defaults={"mode": "acceptEdits"},
-        stream_json_filter=True,
+        output_filter="claude-stream-json",
     ),
     "codex": ToolConfig(
         spec=(
-            "codex exec "
+            "codex exec --json "
             "[model:--model {value}:gpt-5.4|gpt-5.4-mini|gpt-5.3-codex|gpt-5.3-codex-spark|gpt-5.2] "
             "[effort:-c model_reasoning_effort={value}:low|medium|high|xhigh] "
             "{{preset}} {{extra}} {{prompt}}"
         ),
         worker_preset="--full-auto",
         reviewer_preset="--sandbox workspace-write",
+        output_filter="codex-exec-json",
     ),
     "copilot": ToolConfig(
         spec=(
-            "copilot --no-ask-user --allow-all "
+            "copilot --output-format json --no-ask-user --allow-all "
             "[model:--model {value}:gpt-5.4|gpt-5.3-Codex|gpt-5.2-Codex|gpt-5.2|gpt-5.1|gpt-5.4-mini|gpt-5-mini|gpt-4.1|claude-sonnet-4.6|claude-sonnet-4.5|claude-haiku-4.5|claude-opus-4.7|claude-opus-4.6|claude-opus-4.5|claude-sonnet-4] "
             "[effort:--reasoning-effort {value}:low|medium|high|xhigh] "
             "{{preset}} {{extra}} -p {{prompt}}"
         ),
         worker_preset="--autopilot",
         reviewer_preset="--autopilot",
+        output_filter="copilot-json",
     ),
 }
 
@@ -226,7 +230,7 @@ def build_argument_parser() -> CatchballArgumentParser:
     parser.add_argument(
         "--phase-delay",
         type=lambda value: parse_integer("--phase-delay", value, allow_zero=True),
-        default=0,
+        default=3,
         metavar="<seconds>",
     )
     parser.add_argument("--continue-despite-failures", action="store_true")
@@ -336,6 +340,10 @@ class CatchballRunner:
         self.console_live_status = self.choose_console_live_status()
         self.live_status_width = 0
         self.live_status_index = 0
+        self.live_status_message = ""
+        self.live_status_lock = threading.Lock()
+        self.live_status_stop_event: threading.Event | None = None
+        self.live_status_thread: threading.Thread | None = None
         self.run_id = datetime.now().strftime("%Y%m%d%H%M%S") + f"-{os.getpid()}"
         self.run_folder = datetime.now().strftime("%d-%m-%y--%H--%M--%S") + f"--{os.getpid()}"
         self.host_name = socket.gethostname() or "unknown"
@@ -350,6 +358,7 @@ class CatchballRunner:
         self.tasks: list[Path] = []
         self.start_index = 0
         self.current_lock_file: Path | None = None
+        self.last_lock_conflict_message = ""
         self.heartbeat_stop_event: threading.Event | None = None
         self.heartbeat_thread: threading.Thread | None = None
         self.current_role_process: subprocess.Popen | None = None
@@ -375,15 +384,17 @@ class CatchballRunner:
             raise CatchballError("Both --worker and --reviewer are required")
         if not self.root_dir.is_dir():
             raise CatchballError(f"Project root not found: {self.root_dir}")
-        self.require_positive_integer("--review-passes", self.settings.review_passes)
+        for option_name, value in (
+            ("--review-passes", self.settings.review_passes),
+            ("--lock-timeout", self.settings.lock_stale_timeout),
+            ("--lock-heartbeat", self.settings.lock_heartbeat_interval),
+            ("--health-check-interval", self.settings.role_health_check_interval),
+            ("--idle-timeout", self.settings.role_idle_timeout),
+        ):
+            if value <= 0:
+                raise CatchballError(f"{option_name} must be greater than zero")
         if self.settings.phase_delay_seconds < 0:
             raise CatchballError("--phase-delay must be a non-negative integer")
-        self.require_positive_integer("--lock-timeout", self.settings.lock_stale_timeout)
-        self.require_positive_integer("--lock-heartbeat", self.settings.lock_heartbeat_interval)
-        self.require_positive_integer(
-            "--health-check-interval", self.settings.role_health_check_interval
-        )
-        self.require_positive_integer("--idle-timeout", self.settings.role_idle_timeout)
         if self.settings.lock_heartbeat_interval >= self.settings.lock_stale_timeout:
             raise CatchballError("--lock-heartbeat must be smaller than --lock-timeout")
         if self.settings.role_health_check_interval > self.settings.role_idle_timeout:
@@ -399,7 +410,8 @@ class CatchballRunner:
         for role_name in roles_to_validate:
             role = self.role_settings(role_name)
             self.validate_role_tool(role)
-            self.validate_role_settings(role_name, role)
+            for kind in ROLE_KINDS:
+                self.validate_role_value(role.tool, kind, self.resolve_role_value(role_name, role, kind))
             self.validate_role_instructions(role_name, role)
 
         self.settings.tasks_dir = self.abs_dir(self.settings.tasks_dir)
@@ -508,7 +520,8 @@ class CatchballRunner:
         assert self.run_results_dir is not None
         assert self.run_review_outputs_dir is not None
         assert self.reviews_dir is not None
-        for task_file in self.tasks[self.start_index :]:
+        pending_tasks = self.tasks[self.start_index :]
+        for task_index, task_file in enumerate(pending_tasks):
             rel_path = self.task_rel(task_file)
             key = self.task_key(task_file)
             active_review_file = self.task_sidecar(task_file, ".review", base_dir=self.reviews_dir)
@@ -519,10 +532,14 @@ class CatchballRunner:
                 continue
 
             if not self.acquire_lock(task_file, rel_path):
-                self.report(f"STOP_LOCKED {rel_path}", "STOP_LOCKED", rel_path, "manual_intervention_required")
+                self.report("locked by another run -> stop", "STOP_LOCKED", rel_path, self.last_lock_conflict_message)
                 self.stopped = True
                 break
 
+            task_started_at = time.monotonic()
+            stage_durations = {"worker": 0.0, "fixer": 0.0, "reviewer": 0.0, "delay": 0.0}
+            stage_counts = {"worker": 0, "fixer": 0, "reviewer": 0}
+            task_result = "stopped"
             task_stopped = False
             had_review_issues = False
             pre_task_dirty: frozenset[str] = self.git_dirty_files()
@@ -533,6 +550,7 @@ class CatchballRunner:
 
                 while True:
                     if self.review_passes_used(task_file) >= self.settings.review_passes:
+                        task_result = "failed_continue" if self.settings.continue_despite_failures else "stopped"
                         task_stopped = self.handle_review_exhausted(task_file, rel_path)
                         break
 
@@ -556,6 +574,7 @@ class CatchballRunner:
                     )
 
                     worker_output_file = self.run_results_dir / f"{key}.{implementation_role}-{implementation_round}.log"
+                    stage_started_at = time.monotonic()
                     role_succeeded, should_stop_run = self.run_role_or_stop(
                         implementation_role,
                         implementation_prompt,
@@ -563,8 +582,11 @@ class CatchballRunner:
                         task_file,
                         rel_path,
                     )
+                    stage_durations[implementation_role] += time.monotonic() - stage_started_at
+                    stage_counts[implementation_role] += 1
                     if not role_succeeded:
                         task_stopped = should_stop_run
+                        task_result = "stopped" if should_stop_run else "failed_continue"
                         break
 
                     previous_review_file: Path | None = None
@@ -573,7 +595,7 @@ class CatchballRunner:
                         if previous_review_file is not None:
                             self.log_run("REVIEW_ARCHIVED", rel_path, f"file={previous_review_file}")
 
-                    self.pause_between_phases(rel_path, implementation_role, "reviewer")
+                    stage_durations["delay"] += self.pause_before_transition(rel_path, implementation_role, "reviewer")
 
                     review_pass = self.next_review_pass(task_file)
                     review_output_file = self.run_review_outputs_dir / f"{key}.review-{review_pass}.log"
@@ -591,15 +613,20 @@ class CatchballRunner:
                         rel_path,
                         f"pass={review_pass}",
                     )
+                    stage_started_at = time.monotonic()
                     role_succeeded, should_stop_run = self.run_role_or_stop(
                         "reviewer",
                         reviewer_prompt,
                         review_output_file,
                         task_file,
                         rel_path,
+                        completion_file=active_review_file,
                     )
+                    stage_durations["reviewer"] += time.monotonic() - stage_started_at
+                    stage_counts["reviewer"] += 1
                     if not role_succeeded:
                         task_stopped = should_stop_run
+                        task_result = "stopped" if should_stop_run else "failed_continue"
                         break
 
                     if not self.active_review_exists(active_review_file):
@@ -608,8 +635,10 @@ class CatchballRunner:
                         self.passed += 1
                         if had_review_issues:
                             self.passed_review += 1
+                            task_result = "passed_review"
                         else:
                             self.passed_clean += 1
+                            task_result = "passed_clean"
                         break
 
                     had_review_issues = True
@@ -620,16 +649,26 @@ class CatchballRunner:
                         f"pass={review_pass} file={active_review_file}",
                     )
                     if review_pass >= self.settings.review_passes:
+                        task_result = "failed_continue" if self.settings.continue_despite_failures else "stopped"
                         task_stopped = self.handle_review_exhausted(task_file, rel_path)
                         break
 
-                    self.pause_between_phases(rel_path, "reviewer", self.implementation_role_name(True))
+                    stage_durations["delay"] += self.pause_before_transition(
+                        rel_path,
+                        "reviewer",
+                        self.implementation_role_name(True),
+                    )
                     implementation_round += 1
             finally:
                 self.release_lock()
 
+            self.report_task_timing(rel_path, task_result, task_started_at, stage_durations, stage_counts)
+
             if task_stopped:
                 break
+
+            if task_index + 1 < len(pending_tasks):
+                self.pause_before_transition(rel_path, "task", "next-task")
 
     def finish_run(self) -> int:
         self.emit()
@@ -648,17 +687,49 @@ class CatchballRunner:
         self.report(summary, "RUN_DONE", "-", f"{summary_message} stopped=0")
         return 1 if self.failed else 0
 
-    def pause_between_phases(self, rel_path: str, from_role: str, to_role: str) -> None:
+    def pause_before_transition(self, rel_path: str, from_step: str, to_step: str) -> int:
         delay = self.settings.phase_delay_seconds
         if delay <= 0:
-            return
+            return 0
+        target_label = to_step.replace("-", " ")
         self.report(
-            f"WAIT {rel_path} {delay}s before {to_role}",
+            f"WAIT {rel_path} {delay}s before {target_label}",
             "PHASE_DELAY",
             rel_path,
-            f"from={from_role} to={to_role} seconds={delay}",
+            f"from={from_step} to={to_step} seconds={delay}",
         )
         time.sleep(delay)
+        return delay
+
+    def report_task_timing(
+        self,
+        task_label: str,
+        status: str,
+        task_started_at: float,
+        stage_durations: dict[str, float],
+        stage_counts: dict[str, int],
+    ) -> None:
+        total_seconds = max(0, int(round(time.monotonic() - task_started_at)))
+        worker_seconds = max(0, int(round(stage_durations.get("worker", 0.0))))
+        fixer_seconds = max(0, int(round(stage_durations.get("fixer", 0.0))))
+        reviewer_seconds = max(0, int(round(stage_durations.get("reviewer", 0.0))))
+        delay_seconds = max(0, int(round(stage_durations.get("delay", 0.0))))
+        self.report(
+            "timing "
+            f"total {self.format_duration(total_seconds)} | "
+            f"worker {self.format_duration(worker_seconds)} x{stage_counts.get('worker', 0)} | "
+            f"fixer {self.format_duration(fixer_seconds)} x{stage_counts.get('fixer', 0)} | "
+            f"reviewer {self.format_duration(reviewer_seconds)} x{stage_counts.get('reviewer', 0)} | "
+            f"delay {self.format_duration(delay_seconds)} | "
+            f"status {status}",
+            "TASK_TIMING",
+            task_label,
+            "status="
+            f"{status} total={total_seconds} worker={worker_seconds} worker_rounds={stage_counts.get('worker', 0)} "
+            f"fixer={fixer_seconds} fixer_rounds={stage_counts.get('fixer', 0)} "
+            f"reviewer={reviewer_seconds} reviewer_rounds={stage_counts.get('reviewer', 0)} "
+            f"delay={delay_seconds}",
+        )
 
     def handle_review_exhausted(self, task: Path, task_label: str) -> bool:
         self.record_task_failure(task, "review_passes_exhausted")
@@ -669,19 +740,32 @@ class CatchballRunner:
         self.stopped = True
         return True
 
-    def run_role_or_stop(self, role_name: str, prompt: str, output_file: Path, task: Path, task_label: str) -> tuple[bool, bool]:
+    def run_role_or_stop(
+        self,
+        role_name: str,
+        prompt: str,
+        output_file: Path,
+        task: Path,
+        task_label: str,
+        *,
+        completion_file: Path | None = None,
+    ) -> tuple[bool, bool]:
         status = self.run_role_to_file(role_name, prompt, output_file, task_label)
         if status == 0:
             return True, False
-        event, reason = self.role_failure_details(role_name, status)
-        detail = f"{reason} file={output_file}"
-        if event == "STOP_ERROR":
-            detail = f"{reason} code={status} file={output_file}"
+        if status == 73 and completion_file is not None and self.file_has_content(completion_file):
+            self.log_run(
+                "ROLE_BLOCKED_IGNORED",
+                task_label,
+                f"role={role_name} file={output_file} artifact={completion_file}",
+            )
+            return True, False
+        event, reason, detail = self.role_failure_report(role_name, status, output_file)
         if self.settings.continue_despite_failures:
             self.record_task_failure(task, reason)
             self.report(f"FAIL_CONTINUE {task_label}", "FAIL_CONTINUE", task_label, detail)
             return False, False
-        self.handle_role_failure(task_label, role_name, status, output_file)
+        self.report(f"{event} {task_label}", event, task_label, detail)
         self.stopped = True
         return False, True
 
@@ -749,25 +833,25 @@ class CatchballRunner:
             exit_code = process.wait()
             self.current_role_process = None
             self.log_run("ROLE_EXIT", task_label, f"role={role_name} pid={process.pid} code={exit_code} file={output_file}")
-            if exit_code == 0 and self.role_output_is_write_blocked(output_file):
+            if exit_code == 0 and self.role_output_is_write_blocked(role_name, output_file):
                 self.log_run("ROLE_BLOCKED", task_label, f"role={role_name} file={output_file}")
                 return 73
             return exit_code
         finally:
             self.clear_live_status()
 
-    def handle_role_failure(self, task_label: str, role_name: str, status: int, output_file: Path) -> None:
-        event, reason = self.role_failure_details(role_name, status)
-        detail = f"{reason} file={output_file}"
-        if event == "STOP_ERROR":
-            detail = f"{reason} code={status} file={output_file}"
-        self.report(f"{event} {task_label}", event, task_label, detail)
-
     def role_failure_details(self, role_name: str, status: int) -> tuple[str, str]:
         return {
             124: ("STOP_STALL", f"{role_name}_stalled"),
             73: ("STOP_BLOCKED", f"{role_name}_write_blocked"),
         }.get(status, ("STOP_ERROR", f"{role_name}_failed"))
+
+    def role_failure_report(self, role_name: str, status: int, output_file: Path) -> tuple[str, str, str]:
+        event, reason = self.role_failure_details(role_name, status)
+        detail = f"{reason} file={output_file}"
+        if event == "STOP_ERROR":
+            detail = f"{reason} code={status} file={output_file}"
+        return event, reason, detail
 
     def implementation_prompt_text(self, role_name: str, task: Path, review: Path | None, diff_stat: str = "") -> str:
         if review is not None and self.file_has_content(review):
@@ -783,6 +867,7 @@ class CatchballRunner:
         else:
             lines = [f"Implement the task in {task}.", ""]
         lines.extend(self.role_instruction_lines(role_name))
+        lines.extend(self.permission_signal_lines())
         lines.append(f"Do not create, rename, or edit files under {self.reviews_dir}.")
         return "\n".join(lines) + "\n"
 
@@ -800,6 +885,7 @@ class CatchballRunner:
         if diff_stat:
             lines.extend(("", "Changed files (git diff HEAD --stat):", diff_stat))
         lines.extend(self.role_instruction_lines("reviewer"))
+        lines.extend(self.permission_signal_lines())
         if previous_review is not None:
             lines.extend(("", f"The previous resolved review comments are in {previous_review}.", "Check whether they were addressed before writing a new review."))
         return "\n".join(lines) + "\n"
@@ -838,14 +924,19 @@ class CatchballRunner:
             return False
         return bool(NON_WHITESPACE_RE.search(contents))
 
-    def role_output_is_write_blocked(self, output_file: Path) -> bool:
+    def role_output_is_write_blocked(self, role_name: str, output_file: Path) -> bool:
         if not output_file.is_file():
             return False
         try:
             contents = output_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             return False
-        return bool(ROLE_WRITE_BLOCK_RE.search(contents))
+        lines = contents.splitlines()
+        if any(ROLE_PERMISSION_SIGNAL_RE.search(line) for line in lines):
+            return True
+        if self.role_settings(role_name).tool in {"claude", "codex", "copilot"}:
+            return False
+        return any(ROLE_WRITE_BLOCK_RE.search(line) for line in lines)
 
     def latest_review_archive_index(self, task: Path) -> int:
         assert self.reviews_dir is not None
@@ -935,9 +1026,11 @@ class CatchballRunner:
                     lock_path.unlink(missing_ok=True)
                     self.report(f"STALE_LOCK_CLEARED {rel_path}", "STALE_LOCK_CLEARED", rel_path)
                     continue
+                self.last_lock_conflict_message = self.lock_conflict_message(lock_path)
                 return False
             else:
                 os.close(fd)
+                self.last_lock_conflict_message = ""
                 self.current_lock_file = lock_path
                 self.write_lock(lock_path)
                 self.start_heartbeat(lock_path)
@@ -964,6 +1057,20 @@ class CatchballRunner:
         if self.lock_holder_is_alive(lock_path):
             return False
         return True
+
+    def lock_timeout_remaining(self, lock_path: Path) -> int:
+        try:
+            mtime = int(lock_path.stat().st_mtime)
+        except OSError:
+            return 0
+        age = max(0, self.now() - mtime)
+        return max(0, self.settings.lock_stale_timeout - age)
+
+    def lock_conflict_message(self, lock_path: Path) -> str:
+        return (
+            f"lock_path={json.dumps(str(lock_path))} "
+            f"timeout_remaining={self.lock_timeout_remaining(lock_path)}"
+        )
 
     def start_heartbeat(self, lock_path: Path) -> None:
         self.stop_heartbeat()
@@ -1011,6 +1118,7 @@ class CatchballRunner:
         self.stop_role_process()
         self.release_lock()
         self.clear_live_status()
+        self.stop_live_status_thread()
 
     def process_tree(self, root_pid: int) -> list[psutil.Process]:
         try:
@@ -1070,7 +1178,13 @@ class CatchballRunner:
         command_args = self.render_tool_command(role_name, role, prompt)
         launch_command = self.prepare_launch_command(role.binary_path, command_args)
         tool_config = TOOLS[role.tool]
-        if tool_config.stream_json_filter:
+        filter_targets = {
+            "claude-stream-json": self._claude_stream_json_filter_thread,
+            "codex-exec-json": self._codex_exec_json_filter_thread,
+            "copilot-json": self._copilot_json_filter_thread,
+        }
+        filter_target = filter_targets.get(tool_config.output_filter)
+        if filter_target is not None:
             with output_file.open("ab") as stderr_handle:
                 proc = subprocess.Popen(
                     launch_command,
@@ -1081,7 +1195,7 @@ class CatchballRunner:
                     stdin=subprocess.DEVNULL,
                 )
             thread = threading.Thread(
-                target=self._stream_json_filter_thread,
+                target=filter_target,
                 args=(proc, output_file),
                 daemon=True,
             )
@@ -1097,7 +1211,8 @@ class CatchballRunner:
                 stdin=subprocess.DEVNULL,
             )
 
-    def _stream_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
+    def _claude_stream_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
+        line_open = False
         with output_file.open("ab") as f:
             for raw_line in proc.stdout:
                 line = raw_line.strip()
@@ -1107,18 +1222,139 @@ class CatchballRunner:
                     event = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
                     continue
-                if event.get("type") != "stream_event":
-                    continue
-                inner = event.get("event", {})
-                if inner.get("type") != "content_block_delta":
-                    continue
-                delta = inner.get("delta", {})
-                if delta.get("type") != "text_delta":
-                    continue
-                text = delta.get("text", "")
+                text = self.claude_event_text(event)
                 if text:
-                    f.write(text.encode("utf-8", errors="replace"))
-                    f.flush()
+                    line_open = self.write_filtered_chunk(f, text, line_open)
+            self.write_filtered_break(f, line_open)
+
+    def _codex_exec_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
+        line_open = False
+        with output_file.open("ab") as f:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                text = self.codex_event_text(event)
+                if text:
+                    line_open = self.write_filtered_line(f, text, line_open)
+            self.write_filtered_break(f, line_open)
+
+    def _copilot_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
+        streamed_message_ids: set[str] = set()
+        stream_kind = ""
+        stream_id = ""
+        line_open = False
+        with output_file.open("ab") as f:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                data = event.get("data")
+                event_type = str(event.get("type", ""))
+                if event_type == "assistant.reasoning_delta" and isinstance(data, dict):
+                    reasoning_id = str(data.get("reasoningId", ""))
+                    delta_text = str(data.get("deltaContent", ""))
+                    if not delta_text:
+                        continue
+                    if stream_kind != "reasoning" or stream_id != reasoning_id:
+                        line_open = self.write_filtered_break(f, line_open)
+                        line_open = self.write_filtered_chunk(f, "[reasoning] ", line_open)
+                    stream_kind = "reasoning"
+                    stream_id = reasoning_id
+                    line_open = self.write_filtered_chunk(f, delta_text, line_open)
+                    continue
+                if event_type == "assistant.message_delta" and isinstance(data, dict):
+                    message_id = str(data.get("messageId", ""))
+                    delta_text = str(data.get("deltaContent", ""))
+                    if not delta_text:
+                        continue
+                    if stream_kind != "message" or stream_id != message_id:
+                        line_open = self.write_filtered_break(f, line_open)
+                    stream_kind = "message"
+                    stream_id = message_id
+                    if message_id:
+                        streamed_message_ids.add(message_id)
+                    line_open = self.write_filtered_chunk(f, delta_text, line_open)
+                    continue
+                if event_type == "assistant.message" and isinstance(data, dict):
+                    stream_kind = ""
+                    stream_id = ""
+                    message_id = str(data.get("messageId", ""))
+                    message_text = str(data.get("content", ""))
+                    if message_text and message_id not in streamed_message_ids:
+                        line_open = self.write_filtered_line(f, message_text, line_open)
+                    continue
+                if event_type == "tool.execution_start" and isinstance(data, dict):
+                    stream_kind = ""
+                    stream_id = ""
+                    tool_name = str(data.get("toolName", "")).strip()
+                    if tool_name:
+                        line_open = self.write_filtered_line(f, f"[tool] {tool_name}", line_open)
+                    continue
+                if event_type == "assistant.turn_end":
+                    stream_kind = ""
+                    stream_id = ""
+                    line_open = self.write_filtered_break(f, line_open)
+            self.write_filtered_break(f, line_open)
+
+    def write_filtered_chunk(self, handle: IO[bytes], text: str, line_open: bool) -> bool:
+        if not text:
+            return line_open
+        handle.write(text.encode("utf-8", errors="replace"))
+        handle.flush()
+        return not text.endswith("\n")
+
+    def write_filtered_line(self, handle: IO[bytes], text: str, line_open: bool) -> bool:
+        if line_open:
+            handle.write(b"\n")
+        rendered = text if text.endswith("\n") else f"{text}\n"
+        handle.write(rendered.encode("utf-8", errors="replace"))
+        handle.flush()
+        return False
+
+    def write_filtered_break(self, handle: IO[bytes], line_open: bool) -> bool:
+        if line_open:
+            handle.write(b"\n")
+            handle.flush()
+        return False
+
+    def claude_event_text(self, event: dict[str, object]) -> str:
+        if event.get("type") != "stream_event":
+            return ""
+        inner = event.get("event", {})
+        if not isinstance(inner, dict) or inner.get("type") != "content_block_delta":
+            return ""
+        delta = inner.get("delta", {})
+        if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+            return ""
+        return str(delta.get("text", ""))
+
+    def codex_event_text(self, event: dict[str, object]) -> str:
+        event_type = str(event.get("type", ""))
+        if event_type == "error":
+            return str(event.get("message", "")).strip()
+        if event_type != "item.completed":
+            return ""
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return ""
+        item_type = str(item.get("type", ""))
+        if item_type == "agent_message":
+            return str(item.get("text", "")).strip()
+        if item_type == "reasoning":
+            text = item.get("text") or item.get("summary") or ""
+            if isinstance(text, str):
+                text = text.strip()
+                return f"[reasoning] {text}" if text else ""
+        return ""
 
     def render_tool_command(self, role_name: str, role: RoleSettings, prompt: str) -> list[str]:
         tool_config = TOOLS[role.tool]
@@ -1152,10 +1388,6 @@ class CatchballRunner:
             else:
                 output_args.append(token)
         return output_args
-
-    def validate_role_settings(self, role_name: str, role: RoleSettings) -> None:
-        for kind in ROLE_KINDS:
-            self.validate_role_value(role.tool, kind, self.resolve_role_value(role_name, role, kind))
 
     def validate_role_value(self, tool_name: str, kind: str, resolved_value: str) -> None:
         if not resolved_value:
@@ -1256,6 +1488,13 @@ class CatchballRunner:
             lines.append(f"Additional {label} are in {instructions_file}.")
             lines.append(f"Read and follow that file before continuing the {action}.")
         return lines
+
+    def permission_signal_lines(self) -> list[str]:
+        return [
+            "",
+            "If a real permission or access denial blocks required work, include this exact marker in your final response: permission denied <path-or-tool>.",
+            "Use that marker only for an actual blocking permission problem, not for unrelated warnings.",
+        ]
 
     def split_spec_parts(self, spec: str) -> list[str]:
         parts: list[str] = []
@@ -1372,6 +1611,7 @@ class CatchballRunner:
             "REVIEW",
             "REVIEW_FAIL",
             "PASS",
+            "TASK_TIMING",
             "FAIL_CONTINUE",
             "SKIP_DONE",
             "STOP_LOCKED",
@@ -1400,15 +1640,31 @@ class CatchballRunner:
         if event == "PASS":
             lines.append(self.format_status_line("clean", self.console_glyphs.clean, "clean -> done"))
             return lines
+        if event == "TASK_TIMING":
+            lines.append(self.format_notice_line("  ", "summary", self.console_glyphs.summary, line))
+            return lines
         if event == "FAIL_CONTINUE":
             lines.append(self.format_notice_line("    ", "stop", self.console_glyphs.stop, f"{self.failure_reason_text(message)} -> failed"))
-            lines.append(self.format_notice_line("    ", "skip", self.console_glyphs.skip, "continuing to next task"))
+            lines.append(self.format_notice_line("  ", "skip", self.console_glyphs.skip, "continuing to next task"))
             return lines
         if event == "SKIP_DONE":
             lines.append(self.format_notice_line("  ", "skip", self.console_glyphs.skip, "already done"))
             return lines
         if event == "STOP_LOCKED":
-            lines.append(self.format_notice_line("  ", "stop", self.console_glyphs.stop, "locked by another run -> stop"))
+            lines.append(self.format_notice_line("  ", "stop", self.console_glyphs.stop, line))
+            lock_path = self.message_quoted_value(message, "lock_path")
+            if lock_path:
+                lines.append(self.format_notice_line("    ", "wait", self.console_glyphs.wait, f"delete {lock_path} to run anyway"))
+            timeout_remaining = self.message_value(message, "timeout_remaining")
+            if timeout_remaining.isdigit() and int(timeout_remaining) > 0:
+                lines.append(
+                    self.format_notice_line(
+                        "    ",
+                        "wait",
+                        self.console_glyphs.wait,
+                        f"if the old run is gone, catchball will clear it automatically in about {self.format_duration(int(timeout_remaining))}",
+                    )
+                )
             return lines
         if event == "STOP_BLOCKED":
             role_name = self.role_name_from_status(message, "_write_blocked") or "role"
@@ -1427,7 +1683,7 @@ class CatchballRunner:
             return lines
         if event == "PHASE_DELAY":
             delay_seconds = self.message_value(message, "seconds") or "?"
-            target_role = self.message_value(message, "to") or "next step"
+            target_role = (self.message_value(message, "to") or "next step").replace("-", " ")
             lines.append(self.format_notice_line("    ", "wait", self.console_glyphs.wait, f"wait {delay_seconds}s before {target_role}"))
             return lines
         if event == "STALE_LOCK_CLEARED":
@@ -1477,6 +1733,15 @@ class CatchballRunner:
             if token.startswith(prefix):
                 return token[len(prefix) :]
         return ""
+
+    def message_quoted_value(self, message: str, key_name: str) -> str:
+        match = re.search(rf'{re.escape(key_name)}=("(?:[^"\\]|\\.)*")', message)
+        if not match:
+            return ""
+        try:
+            return str(json.loads(match.group(1)))
+        except json.JSONDecodeError:
+            return match.group(1).strip('"')
 
     def role_name_from_status(self, message: str, suffix: str) -> str:
         first_token = message.split(" ", 1)[0]
@@ -1590,6 +1855,37 @@ class CatchballRunner:
         self.live_status_index += 1
         return frame
 
+    def ensure_live_status_thread(self) -> None:
+        if not self.console_live_status or self.live_status_thread is not None:
+            return
+        stop_event = threading.Event()
+
+        def refresh_live_status() -> None:
+            while not stop_event.wait(LIVE_STATUS_REFRESH_SECONDS):
+                with self.live_status_lock:
+                    if not self.live_status_message:
+                        continue
+                    self.write_live_status_locked(self.live_status_message)
+
+        thread = threading.Thread(target=refresh_live_status, name="catchball-live-status", daemon=True)
+        thread.start()
+        self.live_status_stop_event = stop_event
+        self.live_status_thread = thread
+
+    def stop_live_status_thread(self) -> None:
+        if self.live_status_stop_event is not None:
+            self.live_status_stop_event.set()
+        if self.live_status_thread is not None:
+            self.live_status_thread.join(timeout=1)
+        self.live_status_stop_event = None
+        self.live_status_thread = None
+
+    def write_live_status_locked(self, message: str) -> None:
+        rendered = f"{self.spinner_frame()} {message}"
+        self.live_status_width = max(self.live_status_width, len(rendered))
+        self.stdout.write("\r" + rendered.ljust(self.live_status_width))
+        self.stdout.flush()
+
     def format_bytes(self, byte_count: int) -> str:
         units = ("B", "KB", "MB", "GB")
         value = float(byte_count)
@@ -1601,19 +1897,34 @@ class CatchballRunner:
             value /= 1024
         return f"{int(byte_count)} B"
 
+    def format_duration(self, seconds: int | float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h{minutes:02d}m{secs:02d}s"
+        if minutes:
+            return f"{minutes}m{secs:02d}s"
+        return f"{secs}s"
+
     def emit_live_status(self, message: str) -> None:
         if not self.console_live_status:
             return
-        self.live_status_width = max(self.live_status_width, len(message))
-        self.stdout.write("\r" + message.ljust(self.live_status_width))
-        self.stdout.flush()
+        self.ensure_live_status_thread()
+        with self.live_status_lock:
+            self.live_status_message = message
+            self.write_live_status_locked(message)
 
     def clear_live_status(self) -> None:
-        if not self.console_live_status or self.live_status_width <= 0:
+        if not self.console_live_status:
             return
-        self.stdout.write("\r" + (" " * self.live_status_width) + "\r")
-        self.stdout.flush()
-        self.live_status_width = 0
+        with self.live_status_lock:
+            self.live_status_message = ""
+            if self.live_status_width <= 0:
+                return
+            self.stdout.write("\r" + (" " * self.live_status_width) + "\r")
+            self.stdout.flush()
+            self.live_status_width = 0
 
     def role_health_activity_text(self, health_status: str, idle_for: int, output_bytes: int) -> str:
         if health_status == "starting":
@@ -1633,12 +1944,20 @@ class CatchballRunner:
         elapsed = max(0, self.now() - started_at)
         activity = self.role_health_activity_text(health_status, idle_for, output_bytes)
         self.emit_live_status(
-            f"{self.spinner_frame()} {role_name} ({role_tool}) health ok | alive {elapsed}s | {activity} | {self.format_bytes(output_bytes)} log"
+            f"{role_name} ({role_tool}) health ok | alive {elapsed}s | {activity} | {self.format_bytes(output_bytes)} log"
         )
 
     def emit(self, message: str = "") -> None:
-        self.clear_live_status()
-        print(message, file=self.stdout, flush=True)
+        if not self.console_live_status:
+            print(message, file=self.stdout, flush=True)
+            return
+        with self.live_status_lock:
+            self.live_status_message = ""
+            if self.live_status_width > 0:
+                self.stdout.write("\r" + (" " * self.live_status_width) + "\r")
+                self.stdout.flush()
+                self.live_status_width = 0
+            print(message, file=self.stdout, flush=True)
 
     def append_text(self, file_path: Path, text: str) -> None:
         with file_path.open("a", encoding="utf-8") as handle:
@@ -1675,10 +1994,6 @@ class CatchballRunner:
 
     def timestamp(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    def require_positive_integer(self, option: str, value: int) -> None:
-        if value <= 0:
-            raise CatchballError(f"{option} must be greater than zero")
 
     def _git(self, *args: str) -> subprocess.CompletedProcess | None:
         try:
@@ -1721,7 +2036,7 @@ class CatchballRunner:
         return "\n".join(kept)
 
 
-def install_signal_handlers(runner: CatchballRunner) -> callable:
+def install_signal_handlers(runner: CatchballRunner) -> Callable[[], None]:
     previous_handlers: dict[int, object] = {}
 
     def handler(signum: int, frame: object) -> None:

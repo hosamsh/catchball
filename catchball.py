@@ -183,6 +183,16 @@ TOOLS: dict[str, ToolConfig] = {
         reviewer_preset="--autopilot",
         output_filter="copilot-json",
     ),
+    "opencode": ToolConfig(
+        spec=(
+            "opencode run --format json "
+            "[model:--model {value}:provider/model] "
+            "{{preset}} {{extra}} {{prompt}}"
+        ),
+        worker_preset="--dangerously-skip-permissions",
+        reviewer_preset="--dangerously-skip-permissions",
+        output_filter="opencode-json",
+    ),
 }
 
 class CatchballArgumentParser(argparse.ArgumentParser):
@@ -1195,6 +1205,7 @@ class CatchballRunner:
             "claude-stream-json": self._claude_stream_json_filter_thread,
             "codex-exec-json": self._codex_exec_json_filter_thread,
             "copilot-json": self._copilot_json_filter_thread,
+            "opencode-json": self._opencode_json_filter_thread,
         }
         filter_target = filter_targets.get(tool_config.output_filter)
         if filter_target is not None:
@@ -1318,6 +1329,22 @@ class CatchballRunner:
                     line_open = self.write_filtered_break(f, line_open)
             self.write_filtered_break(f, line_open)
 
+    def _opencode_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
+        line_open = False
+        with output_file.open("ab") as f:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                text = self.opencode_event_text(event)
+                if text:
+                    line_open = self.write_filtered_line(f, text, line_open)
+            self.write_filtered_break(f, line_open)
+
     def write_filtered_chunk(self, handle: IO[bytes], text: str, line_open: bool) -> bool:
         if not text:
             return line_open
@@ -1368,6 +1395,34 @@ class CatchballRunner:
                 text = text.strip()
                 return f"[reasoning] {text}" if text else ""
         return ""
+
+    def opencode_event_text(self, event: dict[str, object]) -> str:
+        event_type = str(event.get("type", ""))
+        if event_type in {"text", "reasoning", "tool_use", "step_start", "step_finish"}:
+            part = event.get("part")
+            if not isinstance(part, dict):
+                return ""
+            if event_type == "text":
+                return str(part.get("text", "")).strip()
+            if event_type == "reasoning":
+                text = str(part.get("text", "")).strip()
+                return f"[reasoning] {text}" if text else ""
+            if event_type == "tool_use":
+                tool_name = str(part.get("tool", "")).strip()
+                return f"[tool] {tool_name}" if tool_name else ""
+            step_type = str(part.get("type", "")).strip()
+            return f"[step] {step_type}" if step_type else ""
+        if event_type != "error":
+            return ""
+        error = event.get("error")
+        if not isinstance(error, dict):
+            return str(error).strip()
+        data = error.get("data")
+        if isinstance(data, dict):
+            message = str(data.get("message", "")).strip()
+            if message:
+                return message
+        return str(error.get("name", "")).strip()
 
     def render_tool_command(self, role_name: str, role: RoleSettings, prompt: str) -> list[str]:
         tool_config = TOOLS[role.tool]
@@ -1566,6 +1621,8 @@ class CatchballRunner:
         if not normalized_value:
             return ""
         for supported_value in supported_values:
+            if kind == "model" and supported_value == "provider/model" and "/" in normalized_value:
+                return value.strip()
             if normalize_role_value(kind, supported_value) == normalized_value:
                 return supported_value
         return ""

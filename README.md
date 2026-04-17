@@ -26,6 +26,7 @@ Each task runs through this loop until it passes or fails.
     - [Claude Code](https://code.claude.com/docs/en/overview)
     - [OpenAI Codex](https://developers.openai.com/codex/cli)
     - [GitHub Copilot](https://github.com/features/copilot/cli)
+    - [OpenCode](https://opencode.ai/docs/cli/)
 
 ## Quick start
 Run from a local checkout:
@@ -61,7 +62,7 @@ Agents run inside `project-root` and pick up any existing harness automatically 
 ## FAQ
 
 ### What tools are supported?
-Claude Code, OpenAI Codex, and GitHub Copilot. You can use one for everything or mix and match as you wish.
+Claude Code, OpenAI Codex, GitHub Copilot, and OpenCode. You can use one for everything or mix and match as you wish.
 
 ### What goes in a task file?
 Plain markdown. Describe what you want built, fixed, or changed. catchball attaches the task file path to the worker as the prompt. One clear goal per file works best.
@@ -74,6 +75,12 @@ Use `--worker-model`, `--reviewer-model`, or `--fixer-model`:
 
 ```bash
 catchball --worker claude --worker-model opus --reviewer codex --reviewer-model gpt-5.4
+```
+
+OpenCode uses its native `provider/model` naming, for example:
+
+```bash
+catchball --worker opencode --worker-model anthropic/claude-sonnet-4-5 --reviewer codex
 ```
 
 ### Can I set the effort level?
@@ -97,6 +104,12 @@ If add `WORKER.md` or `REVIEWER.md` exist at repo root, catchball picks them up 
 
 ```bash
 catchball --worker copilot --fixer codex --reviewer claude
+```
+
+OpenCode works there too:
+
+```bash
+catchball --worker opencode --fixer codex --reviewer claude
 ```
 
 If `FIXER.md` exists at repo root, catchball picks it up. Otherwise it uses `WORKER.md` as guidance.

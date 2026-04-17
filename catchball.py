@@ -139,6 +139,7 @@ class AppSettings:
     state_dir: Path | None = None
     allow_dirty: bool = False
     from_task: str = ""
+    to_task: str = ""
 
 class CatchballError(RuntimeError):
     pass
@@ -221,6 +222,7 @@ def build_argument_parser() -> CatchballArgumentParser:
     parser.add_argument("--project-root", metavar="<dir>")
     parser.add_argument("--tasks", "--tasks-dir", dest="tasks_dir", default="./tasks", metavar="<dir>")
     parser.add_argument("--from", dest="from_task", default="", metavar="<task>")
+    parser.add_argument("--to", dest="to_task", default="", metavar="<task>")
     parser.add_argument(
         "--review-passes",
         type=lambda value: parse_integer("--review-passes", value),
@@ -315,6 +317,7 @@ def parse_cli(argv: Sequence[str]) -> AppSettings:
         state_dir=Path(parsed.state_dir) if parsed.state_dir else None,
         allow_dirty=parsed.allow_dirty,
         from_task=parsed.from_task,
+        to_task=parsed.to_task,
     )
 
 class CatchballRunner:
@@ -452,7 +455,7 @@ class CatchballRunner:
 
     def discover_tasks(self) -> None:
         self.tasks = sorted(
-            (path.resolve() for path in self.settings.tasks_dir.rglob("*.md") if path.is_file()),
+            (path.resolve() for path in self.settings.tasks_dir.glob("*.md") if path.is_file()),
             key=lambda path: self.task_rel(path),
         )
         if not self.tasks:
@@ -460,8 +463,13 @@ class CatchballRunner:
 
         self.start_index = 0
         if self.settings.from_task:
-            self.start_index = self.find_start_index(self.settings.from_task)
-        self.total_tasks = len(self.tasks[self.start_index :])
+            self.start_index = self.find_task_index(self.settings.from_task, "--from")
+        self.end_index = len(self.tasks)
+        if self.settings.to_task:
+            self.end_index = self.find_task_index(self.settings.to_task, "--to") + 1
+        if self.start_index >= self.end_index:
+            raise CatchballError("--from task must come before --to task")
+        self.total_tasks = self.end_index - self.start_index
 
     def print_run_header(self) -> None:
         assert self.state_dir is not None
@@ -473,8 +481,13 @@ class CatchballRunner:
             f"{self.settings.worker.tool} | fixer: {self.fixer_label()} | reviewer: {self.settings.reviewer.tool} | "
             f"tasks: {len(self.tasks)} | review-passes: {self.settings.review_passes}"
         )
-        if self.settings.from_task:
-            self.emit(f"catchball | from: {self.settings.from_task}")
+        if self.settings.from_task or self.settings.to_task:
+            range_parts: list[str] = []
+            if self.settings.from_task:
+                range_parts.append(f"from: {self.settings.from_task}")
+            if self.settings.to_task:
+                range_parts.append(f"to: {self.settings.to_task}")
+            self.emit(f"catchball | {' | '.join(range_parts)}")
         self.emit(f"catchball | project root: {self.root_dir}")
         self.emit(f"catchball | task state: {self.display_task_state_path(self.task_state_dir)}")
         self.emit(f"catchball | run dir: {self.state_dir}")
@@ -502,7 +515,7 @@ class CatchballRunner:
             "worker="
             f"{self.settings.worker.tool} fixer={self.fixer_label(log=True)} reviewer={self.settings.reviewer.tool} "
             f"project_root={self.root_dir} "
-            f"from={self.settings.from_task or 'start'} state_dir={self.state_dir} task_state_dir={self.task_state_dir} "
+            f"from={self.settings.from_task or 'start'} to={self.settings.to_task or 'end'} state_dir={self.state_dir} task_state_dir={self.task_state_dir} "
             f"health={self.settings.role_health_check_interval} idle={self.settings.role_idle_timeout} "
             f"phase_delay={self.settings.phase_delay_seconds} reset_state={int(self.settings.reset_state)}",
         )
@@ -520,7 +533,7 @@ class CatchballRunner:
         assert self.run_results_dir is not None
         assert self.run_review_outputs_dir is not None
         assert self.reviews_dir is not None
-        pending_tasks = self.tasks[self.start_index :]
+        pending_tasks = self.tasks[self.start_index : self.end_index]
         for task_index, task_file in enumerate(pending_tasks):
             rel_path = self.task_rel(task_file)
             key = self.task_key(task_file)
@@ -996,7 +1009,7 @@ class CatchballRunner:
             encoding="utf-8",
         )
 
-    def find_start_index(self, target: str) -> int:
+    def find_task_index(self, target: str, option: str = "--from") -> int:
         prefix_index: int | None = None
         prefix_count = 0
         for index, task in enumerate(self.tasks):
@@ -1010,8 +1023,8 @@ class CatchballRunner:
         if prefix_count == 1 and prefix_index is not None:
             return prefix_index
         if prefix_count > 1:
-            raise CatchballError(f"Start task is ambiguous: {target}")
-        raise CatchballError(f"Start task not found: {target}")
+            raise CatchballError(f"{option} task is ambiguous: {target}")
+        raise CatchballError(f"{option} task not found: {target}")
 
     def acquire_lock(self, task: Path, rel_path: str) -> bool:
         lock_path = self.task_sidecar(task, ".lock")

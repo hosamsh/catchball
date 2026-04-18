@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -15,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Callable, Sequence
+from typing import IO, Callable, Iterator, Sequence
 
 import psutil
 
@@ -28,8 +29,15 @@ ROLE_WRITE_BLOCK_RE = re.compile(
 WINDOWS_BATCH_SUFFIXES = {".bat", ".cmd"}
 LOCK_PROCESS_START_TOLERANCE_SECONDS = 5
 LIVE_STATUS_REFRESH_SECONDS = 0.1
+ROLE_OUTPUT_THREAD_JOIN_SECONDS = 5
+FILTER_MAX_LINE_CHARS = 1024 * 1024
+GIT_COMMAND_TIMEOUT_SECONDS = 30
+ROLE_TOOL_ERROR_MARKER = "[catchball-tool-error]"
+COPILOT_RAW_TOOL_ERROR_LINE_RE = re.compile(r"^error:", re.IGNORECASE)
 ROLE_NAMES = ("worker", "fixer", "reviewer")
 REQUIRED_ROLE_NAMES = ("worker", "reviewer")
+PASSTHROUGH_ARG_OPTIONS = {"--worker-arg", "--fixer-arg", "--reviewer-arg"}
+WINDOWS_CMD_METACHARS = set("&|<>^()%")
 
 @dataclass(frozen=True)
 class ConsoleGlyphs:
@@ -100,6 +108,7 @@ class ToolConfig:
     worker_preset: str = ""
     reviewer_preset: str = ""
     output_filter: str = ""
+    prompt_via_stdin: bool = False
 
     def defaults_for(self, role_name: str) -> dict[str, str]:
         if role_name == "reviewer":
@@ -120,6 +129,11 @@ class RoleSettings:
     instructions_file: Path | None = None
     extra_args: list[str] = field(default_factory=list)
     binary_path: str = ""
+
+@dataclass
+class RoleLaunch:
+    process: subprocess.Popen
+    output_thread: threading.Thread | None = None
 
 @dataclass
 class AppSettings:
@@ -164,13 +178,14 @@ TOOLS: dict[str, ToolConfig] = {
     "codex": ToolConfig(
         spec=(
             "codex exec --json "
-            "[model:--model {value}:gpt-5.4|gpt-5.4-mini|gpt-5.3-codex|gpt-5.3-codex-spark|gpt-5.2] "
+            "[model:--model {value}:gpt-5.4|gpt-5.4-mini|gpt-5.3-codex|gpt-5.3-codex-spark|gpt-5.2|gpt-5.1-codex-mini] "
             "[effort:-c model_reasoning_effort={value}:low|medium|high|xhigh] "
-            "{{preset}} {{extra}} {{prompt}}"
+            "{{preset}} {{extra}} -- {{prompt}}"
         ),
         worker_preset="--full-auto",
         reviewer_preset="--sandbox workspace-write",
         output_filter="codex-exec-json",
+        prompt_via_stdin=True,
     ),
     "copilot": ToolConfig(
         spec=(
@@ -233,7 +248,8 @@ def build_argument_parser() -> CatchballArgumentParser:
     parser.add_argument("--tasks", "--tasks-dir", dest="tasks_dir", default="./tasks", metavar="<dir>")
     parser.add_argument("--from", dest="from_task", default="", metavar="<task>")
     parser.add_argument("--to", dest="to_task", default="", metavar="<task>")
-    parser.add_argument(
+    review_rounds = parser.add_mutually_exclusive_group()
+    review_rounds.add_argument(
         "--review-passes",
         type=lambda value: parse_integer("--review-passes", value),
         default=3,
@@ -247,7 +263,7 @@ def build_argument_parser() -> CatchballArgumentParser:
     )
     parser.add_argument("--continue-despite-failures", action="store_true")
     parser.add_argument("--reset-state", action="store_true")
-    parser.add_argument("--retries", type=lambda value: parse_integer("--retries", value, allow_zero=True), metavar="<n>")
+    review_rounds.add_argument("--retries", type=lambda value: parse_integer("--retries", value, allow_zero=True), metavar="<n>")
     parser.add_argument("--lock-timeout", type=lambda value: parse_integer("--lock-timeout", value), default=10800, metavar="<seconds>")
     parser.add_argument("--lock-heartbeat", type=lambda value: parse_integer("--lock-heartbeat", value), default=60, metavar="<seconds>")
     parser.add_argument("--health-check-interval", type=lambda value: parse_integer("--health-check-interval", value), default=15, metavar="<seconds>")
@@ -263,8 +279,8 @@ def normalize_passthrough_args(argv: Sequence[str]) -> list[str]:
 
     while index < len(argv):
         option = argv[index]
-        if option in {"--worker-arg", "--fixer-arg", "--reviewer-arg"}:
-            if index + 1 >= len(argv) or not argv[index + 1] or argv[index + 1].startswith("--"):
+        if option in PASSTHROUGH_ARG_OPTIONS:
+            if index + 1 >= len(argv) or not argv[index + 1]:
                 raise CatchballError(f"Missing value for {option}")
             normalized.append(f"{option}={argv[index + 1]}")
             index += 2
@@ -289,7 +305,13 @@ def parse_integer(option: str, value: str, *, allow_zero: bool = False) -> int:
 
 def normalize_role_value(kind: str, value: str) -> str:
     normalized = value.strip()
-    if kind == "model":
+    if kind in {"effort", "mode"}:
+        return normalized.lower()
+    return normalized
+
+def normalize_choice_value(kind: str, value: str) -> str:
+    normalized = value.strip()
+    if kind in {"model", "effort", "mode"}:
         return normalized.lower()
     return normalized
 
@@ -298,6 +320,9 @@ def parse_cli(argv: Sequence[str]) -> AppSettings:
     parsed = parser.parse_args(normalize_passthrough_args(argv))
     if parsed.help:
         raise CatchballHelp(parser.format_help().replace("usage:", "Usage:", 1))
+    review_passes = parsed.review_passes
+    if parsed.retries is not None:
+        review_passes = parsed.retries + 1
 
     def build_role(name: str) -> RoleSettings:
         instructions = getattr(parsed, f"{name}_instructions")
@@ -316,7 +341,7 @@ def parse_cli(argv: Sequence[str]) -> AppSettings:
         reviewer=build_role("reviewer"),
         project_root=Path(parsed.project_root) if parsed.project_root else None,
         tasks_dir=Path(parsed.tasks_dir),
-        review_passes=parsed.review_passes if parsed.retries is None else parsed.retries + 1,
+        review_passes=review_passes,
         continue_despite_failures=parsed.continue_despite_failures,
         reset_state=parsed.reset_state,
         phase_delay_seconds=parsed.phase_delay,
@@ -355,10 +380,12 @@ class CatchballRunner:
         self.live_status_index = 0
         self.live_status_message = ""
         self.live_status_lock = threading.Lock()
+        self.current_role_lock = threading.Lock()
         self.live_status_stop_event: threading.Event | None = None
         self.live_status_thread: threading.Thread | None = None
-        self.run_id = datetime.now().strftime("%Y%m%d%H%M%S") + f"-{os.getpid()}"
-        self.run_folder = datetime.now().strftime("%d-%m-%y--%H--%M--%S") + f"--{os.getpid()}"
+        self.run_started_at = datetime.now(timezone.utc)
+        self.run_id = self.run_started_at.strftime("%Y%m%d%H%M%SZ") + f"-{os.getpid()}"
+        self.run_folder = self.run_started_at.strftime("%Y-%m-%d--%H--%M--%SZ") + f"--{os.getpid()}"
         self.host_name = socket.gethostname() or "unknown"
         user_name = self.env.get("USER") or self.env.get("USERNAME") or "unknown"
         self.lock_owner = f"{user_name}@{self.host_name}:{os.getpid()}"
@@ -368,6 +395,7 @@ class CatchballRunner:
         self.run_results_dir: Path | None = None
         self.run_review_outputs_dir: Path | None = None
         self.reviews_dir: Path | None = None
+        self.responses_dir: Path | None = None
         self.tasks: list[Path] = []
         self.start_index = 0
         self.current_lock_file: Path | None = None
@@ -375,6 +403,7 @@ class CatchballRunner:
         self.heartbeat_stop_event: threading.Event | None = None
         self.heartbeat_thread: threading.Thread | None = None
         self.current_role_process: subprocess.Popen | None = None
+        self.current_role_output_thread: threading.Thread | None = None
         self.current_display_task: str | None = None
         self.total_tasks = 0
         self.passed = 0
@@ -430,14 +459,16 @@ class CatchballRunner:
         self.settings.tasks_dir = self.abs_dir(self.settings.tasks_dir)
 
     def initialize_state(self) -> None:
-        self.task_state_dir = self.settings.tasks_dir / "catchball-state"
-        if self.task_state_dir.exists() and not self.task_state_dir.is_dir():
-            raise CatchballError(f"Task state path is not a directory: {self.task_state_dir}")
-
         if self.settings.state_dir is not None:
             self.state_dir = self.make_absolute_path(self.settings.state_dir)
         else:
             self.state_dir = self.root_dir / "catchball-runs" / self.run_folder
+
+        self.task_state_dir = self.default_task_state_dir()
+        legacy_task_state_dirs = self.legacy_task_state_dirs()
+        for state_path in (*legacy_task_state_dirs, self.task_state_dir):
+            if state_path.exists() and not state_path.is_dir():
+                raise CatchballError(f"Task state path is not a directory: {state_path}")
 
         if self.is_inside_git_worktree() and not self.settings.allow_dirty:
             if not self.is_git_worktree_clean():
@@ -445,23 +476,107 @@ class CatchballRunner:
                     "Working tree must be clean. Use --allow-dirty-worktree to override"
                 )
 
-        if self.settings.reset_state and self.task_state_dir.exists():
-            try:
-                shutil.rmtree(self.task_state_dir)
-            except OSError as error:
-                raise CatchballError(
-                    f"Unable to reset task state directory: {self.task_state_dir}"
-                ) from error
+        if self.settings.reset_state:
+            self.reset_task_state_dirs(legacy_task_state_dirs)
+
+        self.migrate_legacy_task_state_dirs(legacy_task_state_dirs)
         self.task_state_dir.mkdir(parents=True, exist_ok=True)
 
         self.run_log = self.state_dir / f"{self.run_id}.log"
         self.run_results_dir = self.state_dir / "worker-output"
         self.run_review_outputs_dir = self.state_dir / "reviewer-output"
         self.reviews_dir = self.state_dir / "reviews"
+        self.responses_dir = self.state_dir / "responses"
         self.ensure_parent_dir(self.run_log)
         self.run_results_dir.mkdir(parents=True, exist_ok=True)
         self.run_review_outputs_dir.mkdir(parents=True, exist_ok=True)
         self.reviews_dir.mkdir(parents=True, exist_ok=True)
+        self.responses_dir.mkdir(parents=True, exist_ok=True)
+
+    def default_task_state_dir(self) -> Path:
+        assert self.state_dir is not None
+        state_root = self.state_dir.parent / "state"
+        return state_root / self.task_state_namespace()
+
+    def task_state_namespace(self) -> str:
+        try:
+            parts = self.settings.tasks_dir.relative_to(self.root_dir).parts
+        except ValueError:
+            parts = tuple(part for part in (self.settings.tasks_dir.parent.name, self.settings.tasks_dir.name) if part)
+        namespace = self.render_task_state_namespace(parts, drop_hidden=True)
+        if namespace:
+            return namespace
+        namespace = self.render_task_state_namespace(parts, drop_hidden=False)
+        if namespace:
+            return namespace
+        fallback = self.sanitize_name(self.settings.tasks_dir.name or "tasks")
+        return fallback or "tasks"
+
+    def render_task_state_namespace(self, parts: Sequence[str], *, drop_hidden: bool) -> str:
+        rendered_parts: list[str] = []
+        for part in parts:
+            if not part or part == ".":
+                continue
+            if drop_hidden and part.startswith("."):
+                continue
+            sanitized = self.sanitize_name(part)
+            if sanitized:
+                rendered_parts.append(sanitized)
+        if not rendered_parts:
+            return ""
+        return "--".join(rendered_parts[-2:])
+
+    def legacy_task_state_dirs(self) -> list[Path]:
+        legacy_dirs = [
+            self.settings.tasks_dir / "catchball-state",
+            self.mirrored_task_state_dir(),
+        ]
+        unique_dirs: list[Path] = []
+        for state_path in legacy_dirs:
+            if state_path == self.task_state_dir or state_path in unique_dirs:
+                continue
+            unique_dirs.append(state_path)
+        return unique_dirs
+
+    def mirrored_task_state_dir(self) -> Path:
+        assert self.state_dir is not None
+        state_root = self.state_dir.parent / "state"
+        try:
+            tasks_relative = self.settings.tasks_dir.relative_to(self.root_dir)
+        except ValueError:
+            tasks_name = self.sanitize_name(self.settings.tasks_dir.name or "tasks")
+            digest = hashlib.sha1(str(self.settings.tasks_dir).encode("utf-8")).hexdigest()[:12]
+            return state_root / f"{tasks_name}-{digest}"
+        return state_root / tasks_relative
+
+    def reset_task_state_dirs(self, legacy_task_state_dirs: Sequence[Path]) -> None:
+        assert self.task_state_dir is not None
+        for state_path in {self.task_state_dir, *legacy_task_state_dirs}:
+            if not state_path.exists():
+                continue
+            try:
+                shutil.rmtree(state_path)
+            except OSError as error:
+                raise CatchballError(
+                    f"Unable to reset task state directory: {state_path}"
+                ) from error
+
+    def migrate_legacy_task_state_dirs(self, legacy_task_state_dirs: Sequence[Path]) -> None:
+        assert self.task_state_dir is not None
+        for legacy_task_state_dir in legacy_task_state_dirs:
+            if not legacy_task_state_dir.exists() or legacy_task_state_dir == self.task_state_dir:
+                continue
+            if self.task_state_dir.exists():
+                return
+            self.task_state_dir.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(legacy_task_state_dir), str(self.task_state_dir))
+            except OSError as error:
+                raise CatchballError(
+                    "Unable to migrate task state directory: "
+                    f"{legacy_task_state_dir} -> {self.task_state_dir}"
+                ) from error
+            return
 
     def discover_tasks(self) -> None:
         self.tasks = sorted(
@@ -470,6 +585,17 @@ class CatchballRunner:
         )
         if not self.tasks:
             raise CatchballError(f"No .md files in {self.settings.tasks_dir}")
+        seen_task_keys: dict[str, str] = {}
+        for task in self.tasks:
+            key = self.task_key(task)
+            rel_path = self.task_rel(task)
+            other = seen_task_keys.get(key)
+            if other is not None:
+                raise CatchballError(
+                    "Task artifact name collision: "
+                    f"{other} and {rel_path} both map to {key}. Rename one of the task files."
+                )
+            seen_task_keys[key] = rel_path
 
         self.start_index = 0
         if self.settings.from_task:
@@ -485,6 +611,7 @@ class CatchballRunner:
         assert self.state_dir is not None
         assert self.task_state_dir is not None
         assert self.reviews_dir is not None
+        assert self.responses_dir is not None
         assert self.run_log is not None
         self.emit(
             "catchball | worker: "
@@ -513,6 +640,7 @@ class CatchballRunner:
         self.emit(f"catchball | worker output: {self.display_run_path(self.run_results_dir)}")
         self.emit(f"catchball | reviewer output: {self.display_run_path(self.run_review_outputs_dir)}")
         self.emit(f"catchball | reviews: {self.display_run_path(self.reviews_dir)}")
+        self.emit(f"catchball | responses: {self.display_run_path(self.responses_dir)}")
         self.emit(f"catchball | run log: {self.display_run_path(self.run_log)}")
         for role_name in self.configured_role_names():
             for label, instructions_file in self.role_instruction_entries(role_name):
@@ -543,11 +671,13 @@ class CatchballRunner:
         assert self.run_results_dir is not None
         assert self.run_review_outputs_dir is not None
         assert self.reviews_dir is not None
+        assert self.responses_dir is not None
         pending_tasks = self.tasks[self.start_index : self.end_index]
         for task_index, task_file in enumerate(pending_tasks):
             rel_path = self.task_rel(task_file)
             key = self.task_key(task_file)
             active_review_file = self.task_sidecar(task_file, ".review", base_dir=self.reviews_dir)
+            active_response_file = self.task_sidecar(task_file, ".response", base_dir=self.responses_dir)
 
             if self.task_sidecar(task_file, ".done").is_file():
                 self.report(f"SKIP_DONE {rel_path}", "SKIP_DONE", rel_path)
@@ -568,7 +698,9 @@ class CatchballRunner:
             pre_task_dirty: frozenset[str] = self.git_dirty_files()
             try:
                 self.ensure_parent_dir(active_review_file)
+                self.ensure_parent_dir(active_response_file)
                 self.cleanup_empty_file(active_review_file)
+                self.cleanup_empty_file(active_response_file)
                 implementation_round = 1
 
                 while True:
@@ -583,6 +715,7 @@ class CatchballRunner:
                         implementation_role,
                         task_file,
                         active_review_file if has_review else None,
+                        active_response_file if has_review else None,
                         diff_stat=self.git_diff_stat(pre_task_dirty) if has_review else "",
                     )
                     event = "RUN_FIX" if has_review else "RUN"
@@ -613,21 +746,27 @@ class CatchballRunner:
                         break
 
                     previous_review_file: Path | None = None
+                    previous_response_file: Path | None = None
                     if self.active_review_exists(active_review_file):
-                        previous_review_file = self.archive_active_review(task_file)
+                        previous_review_file, previous_response_file = self.archive_active_round_feedback(task_file)
                         if previous_review_file is not None:
-                            self.log_run("REVIEW_ARCHIVED", rel_path, f"file={previous_review_file}")
+                            detail = f"review={previous_review_file}"
+                            if previous_response_file is not None:
+                                detail += f" response={previous_response_file}"
+                            self.log_run("REVIEW_ARCHIVED", rel_path, detail)
 
                     stage_durations["delay"] += self.pause_before_transition(rel_path, implementation_role, "reviewer")
 
                     review_pass = self.next_review_pass(task_file)
                     review_output_file = self.run_review_outputs_dir / f"{key}.review-{review_pass}.log"
                     active_review_file.unlink(missing_ok=True)
+                    active_response_file.unlink(missing_ok=True)
                     reviewer_prompt = self.reviewer_prompt_text(
                         task_file,
                         active_review_file,
                         review_pass,
                         previous_review_file,
+                        previous_response_file,
                         diff_stat=self.git_diff_stat(pre_task_dirty),
                     )
                     self.report(
@@ -797,13 +936,14 @@ class CatchballRunner:
         output_file.write_text("", encoding="utf-8")
 
         try:
-            process = self.spawn_role_process(role_name, prompt, output_file)
+            launch = self.spawn_role_process(role_name, prompt, output_file)
         except OSError as exc:
             self.append_text(output_file, f"{exc}\n")
             self.log_run("ROLE_EXIT", task_label, f"role={role_name} pid=-1 code=1 file={output_file}")
             return 1
 
-        self.current_role_process = process
+        process = launch.process
+        self.set_current_role_launch(launch)
         last_activity_at = self.now()
         started_at = last_activity_at
         last_output_state = self.output_state(output_file)
@@ -851,40 +991,84 @@ class CatchballRunner:
                     self.append_text(output_file, f"\ncatchball | {role_name} stalled after {idle_for}s without process or log activity\n")
                     self.log_run("ROLE_STALL", task_label, f"role={role_name} pid={process.pid} idle={idle_for} file={output_file}")
                     self.terminate_process(process)
+                    self.wait_for_role_output_thread(
+                        launch.output_thread,
+                        role_name=role_name,
+                        task_label=task_label,
+                        output_file=output_file,
+                    )
                     return 124
 
             exit_code = process.wait()
-            self.current_role_process = None
+            self.wait_for_role_output_thread(
+                launch.output_thread,
+                role_name=role_name,
+                task_label=task_label,
+                output_file=output_file,
+            )
             self.log_run("ROLE_EXIT", task_label, f"role={role_name} pid={process.pid} code={exit_code} file={output_file}")
-            if exit_code == 0 and self.role_output_is_write_blocked(role_name, output_file):
-                self.log_run("ROLE_BLOCKED", task_label, f"role={role_name} file={output_file}")
-                return 73
+            if exit_code == 0:
+                if self.role_output_has_tool_error(output_file):
+                    self.log_run("ROLE_TOOL_ERROR", task_label, f"role={role_name} file={output_file}")
+                    return 74
+                if self.role_output_is_write_blocked(role_name, output_file):
+                    self.log_run("ROLE_BLOCKED", task_label, f"role={role_name} file={output_file}")
+                    return 73
             return exit_code
         finally:
+            self.clear_current_role_launch(process)
             self.clear_live_status()
 
     def role_failure_details(self, role_name: str, status: int) -> tuple[str, str]:
         return {
             124: ("STOP_STALL", f"{role_name}_stalled"),
             73: ("STOP_BLOCKED", f"{role_name}_write_blocked"),
+            74: ("STOP_ERROR", f"{role_name}_tool_error"),
         }.get(status, ("STOP_ERROR", f"{role_name}_failed"))
 
     def role_failure_report(self, role_name: str, status: int, output_file: Path) -> tuple[str, str, str]:
         event, reason = self.role_failure_details(role_name, status)
         detail = f"{reason} file={output_file}"
-        if event == "STOP_ERROR":
+        if event == "STOP_ERROR" and not reason.endswith("_tool_error"):
             detail = f"{reason} code={status} file={output_file}"
         return event, reason, detail
 
-    def implementation_prompt_text(self, role_name: str, task: Path, review: Path | None, diff_stat: str = "") -> str:
+    def implementation_prompt_text(
+        self,
+        role_name: str,
+        task: Path,
+        review: Path | None,
+        response: Path | None,
+        diff_stat: str = "",
+    ) -> str:
         if review is not None and self.file_has_content(review):
             lines = [
                 f"This task was already implemented. The latest review issues are in {review}.",
                 "Start by reading that file and fix every issue listed there.",
                 f"Use {task} only as the source of truth for the intended outcome.",
                 "Do not re-implement the task from scratch unless a review issue requires it.",
+                "If you intentionally leave any review issue unresolved, record that pushback in a response file for the reviewer.",
                 "",
             ]
+            if response is not None:
+                if self.file_has_content(response):
+                    lines.extend(
+                        (
+                            f"An active fixer response already exists at {response}.",
+                            "Read it first, then replace it with the current unresolved-issue response for this round.",
+                            "If every review issue is now addressed, remove that response file or leave it absent.",
+                            "",
+                        )
+                    )
+                lines.extend(
+                    (
+                        f"If any issue remains disputed after your changes, create exactly one non-empty file at {response}.",
+                        "Reference the reviewer issue IDs when present. If there are no explicit IDs yet, quote enough of the issue text to make the mapping unambiguous.",
+                        "Only include issues you are intentionally not fixing in this round, together with the reason for each one.",
+                        f"Write only to that file under {self.responses_dir}.",
+                        "",
+                    )
+                )
             if diff_stat:
                 lines.extend(("Changed files so far (git diff HEAD --stat):", diff_stat, ""))
         else:
@@ -894,7 +1078,15 @@ class CatchballRunner:
         lines.append(f"Do not create, rename, or edit files under {self.reviews_dir}.")
         return "\n".join(lines) + "\n"
 
-    def reviewer_prompt_text(self, task: Path, review: Path, review_pass: int, previous_review: Path | None, diff_stat: str = "") -> str:
+    def reviewer_prompt_text(
+        self,
+        task: Path,
+        review: Path,
+        review_pass: int,
+        previous_review: Path | None,
+        previous_response: Path | None,
+        diff_stat: str = "",
+    ) -> str:
         lines = [
             f"Review the implementation against the task in {task}.",
             "",
@@ -902,6 +1094,7 @@ class CatchballRunner:
             "Do not change the task file.",
             f"If the implementation is clean, do not create {review}.",
             f"If there are issues, create exactly one non-empty file at {review} and list only the issues that must be fixed.",
+            "If you write a review file, give each issue a stable ID such as R1, R2, R3.",
             f"Write only to that file under {self.reviews_dir}.",
             f"This is review pass {review_pass}.",
         ]
@@ -910,7 +1103,21 @@ class CatchballRunner:
         lines.extend(self.role_instruction_lines("reviewer"))
         lines.extend(self.permission_signal_lines())
         if previous_review is not None:
-            lines.extend(("", f"The previous resolved review comments are in {previous_review}.", "Check whether they were addressed before writing a new review."))
+            lines.extend(
+                (
+                    "",
+                    f"The review issues from the previous round are in {previous_review}.",
+                    "Check whether each one was addressed before writing a new review.",
+                )
+            )
+        if previous_response is not None:
+            lines.extend(
+                (
+                    f"The fixer response for that round is in {previous_response}.",
+                    "Read it before deciding whether any previous issue still stands.",
+                    "If you keep or restate an issue after pushback, keep the same issue ID when practical and say briefly why the pushback was not accepted.",
+                )
+            )
         return "\n".join(lines) + "\n"
 
     def task_relative_path(self, task: Path) -> Path:
@@ -938,6 +1145,10 @@ class CatchballRunner:
         self.cleanup_empty_file(file_path)
         return self.file_has_content(file_path)
 
+    def active_response_exists(self, file_path: Path) -> bool:
+        self.cleanup_empty_file(file_path)
+        return self.file_has_content(file_path)
+
     def file_has_content(self, file_path: Path) -> bool:
         if not file_path.is_file():
             return False
@@ -960,6 +1171,15 @@ class CatchballRunner:
         if self.role_settings(role_name).tool in {"claude", "codex", "copilot"}:
             return False
         return any(ROLE_WRITE_BLOCK_RE.search(line) for line in lines)
+
+    def role_output_has_tool_error(self, output_file: Path) -> bool:
+        if not output_file.is_file():
+            return False
+        try:
+            contents = output_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+        return any(line.startswith(ROLE_TOOL_ERROR_MARKER) for line in contents.splitlines())
 
     def latest_review_archive_index(self, task: Path) -> int:
         assert self.reviews_dir is not None
@@ -993,11 +1213,33 @@ class CatchballRunner:
         active_review.replace(archived_review)
         return archived_review
 
+    def archive_active_response(self, task: Path, archive_index: int) -> Path | None:
+        assert self.responses_dir is not None
+        active_response = self.task_sidecar(task, ".response", base_dir=self.responses_dir)
+        if not self.file_has_content(active_response):
+            return None
+        archived_response = Path(
+            f"{self.task_sidecar(task, '.response.done', base_dir=self.responses_dir)}.{archive_index}"
+        )
+        self.ensure_parent_dir(archived_response)
+        active_response.replace(archived_response)
+        return archived_response
+
+    def archive_active_round_feedback(self, task: Path) -> tuple[Path | None, Path | None]:
+        assert self.reviews_dir is not None
+        review_archive_index = self.next_review_pass(task)
+        previous_review = self.archive_active_review(task)
+        previous_response = self.archive_active_response(task, review_archive_index)
+        return previous_review, previous_response
+
     def log_run(self, event: str, task: str, message: str = "") -> None:
         if self.run_log is None:
             return
+        record = f"{self.timestamp()} event={event} task={json.dumps(task)}"
+        if message:
+            record += f" message={json.dumps(message)}"
         with self.run_log.open("a", encoding="utf-8") as handle:
-            handle.write(f"{self.timestamp()} {event} {task} {message}\n")
+            handle.write(record + "\n")
 
     def write_done(self, task: Path) -> None:
         done_file = self.task_sidecar(task, ".done")
@@ -1125,9 +1367,31 @@ class CatchballRunner:
             self.current_lock_file.unlink(missing_ok=True)
             self.current_lock_file = None
 
+    def set_current_role_launch(self, launch: RoleLaunch) -> None:
+        with self.current_role_lock:
+            self.current_role_process = launch.process
+            self.current_role_output_thread = launch.output_thread
+
+    def clear_current_role_launch(self, process: subprocess.Popen | None = None) -> None:
+        with self.current_role_lock:
+            if process is not None and self.current_role_process is not process:
+                return
+            self.current_role_process = None
+            self.current_role_output_thread = None
+
+    def current_role_launch(self) -> RoleLaunch | None:
+        with self.current_role_lock:
+            if self.current_role_process is None:
+                return None
+            return RoleLaunch(self.current_role_process, self.current_role_output_thread)
+
     def stop_role_process(self) -> None:
-        if self.current_role_process is not None:
-            self.terminate_process(self.current_role_process)
+        launch = self.current_role_launch()
+        if launch is None:
+            return
+        self.terminate_process(launch.process)
+        self.wait_for_role_output_thread(launch.output_thread)
+        self.clear_current_role_launch(launch.process)
 
     def terminate_process(self, process: subprocess.Popen) -> None:
         self.kill_process_tree(process.pid)
@@ -1135,7 +1399,6 @@ class CatchballRunner:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-        self.current_role_process = None
 
     def cleanup(self) -> None:
         self.stop_role_process()
@@ -1196,11 +1459,34 @@ class CatchballRunner:
         if alive:
             psutil.wait_procs(alive, timeout=1)
 
-    def spawn_role_process(self, role_name: str, prompt: str, output_file: Path) -> subprocess.Popen:
+    def wait_for_role_output_thread(
+        self,
+        thread: threading.Thread | None,
+        *,
+        role_name: str = "",
+        task_label: str = "-",
+        output_file: Path | None = None,
+    ) -> None:
+        if thread is None:
+            return
+        thread.join(timeout=ROLE_OUTPUT_THREAD_JOIN_SECONDS)
+        if not thread.is_alive():
+            return
+        if output_file is not None:
+            self.append_text(output_file, "\ncatchball | output drain timed out before final flush\n")
+        if role_name:
+            detail = f"role={role_name}"
+            if output_file is not None:
+                detail += f" file={output_file}"
+            self.log_run("ROLE_OUTPUT_DRAIN_TIMEOUT", task_label, detail)
+
+    def spawn_role_process(self, role_name: str, prompt: str, output_file: Path) -> RoleLaunch:
         role = self.role_settings(role_name)
         command_args = self.render_tool_command(role_name, role, prompt)
         launch_command = self.prepare_launch_command(role.binary_path, command_args)
         tool_config = TOOLS[role.tool]
+        stdin_prompt = self.stdin_prompt_text(role.tool, prompt)
+        stdin_mode = subprocess.PIPE if stdin_prompt is not None else subprocess.DEVNULL
         filter_targets = {
             "claude-stream-json": self._claude_stream_json_filter_thread,
             "codex-exec-json": self._codex_exec_json_filter_thread,
@@ -1209,140 +1495,282 @@ class CatchballRunner:
         }
         filter_target = filter_targets.get(tool_config.output_filter)
         if filter_target is not None:
-            with output_file.open("ab") as stderr_handle:
-                proc = subprocess.Popen(
-                    launch_command,
-                    cwd=self.root_dir,
-                    env=self.env,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr_handle,
-                    stdin=subprocess.DEVNULL,
-                )
+            proc = subprocess.Popen(
+                launch_command,
+                cwd=self.root_dir,
+                env=self.env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=stdin_mode,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            self.write_process_stdin(proc, stdin_prompt)
             thread = threading.Thread(
                 target=filter_target,
                 args=(proc, output_file),
+                name=f"catchball-{role_name}-output",
                 daemon=True,
             )
             thread.start()
-            return proc
-        with output_file.open("ab") as handle:
-            return subprocess.Popen(
+            return RoleLaunch(process=proc, output_thread=thread)
+        handle = output_file.open("ab")
+        try:
+            proc = subprocess.Popen(
                 launch_command,
                 cwd=self.root_dir,
                 env=self.env,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
+                stdin=stdin_mode,
             )
+            self.write_process_stdin(proc, stdin_prompt)
+        finally:
+            handle.close()
+        return RoleLaunch(process=proc)
+
+    def stdin_prompt_text(self, tool_name: str, prompt: str) -> str | None:
+        if TOOLS[tool_name].prompt_via_stdin:
+            return prompt
+        return None
+
+    def write_process_stdin(self, process: subprocess.Popen, prompt: str | None) -> None:
+        if prompt is None or process.stdin is None:
+            return
+        try:
+            if getattr(process.stdin, "encoding", None):
+                process.stdin.write(prompt)
+            else:
+                process.stdin.write(prompt.encode("utf-8"))
+            process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+    def iter_capped_output_lines(self, stream: IO[str]) -> Iterator[tuple[str, bool]]:
+        while True:
+            raw_line = stream.readline(FILTER_MAX_LINE_CHARS + 1)
+            if not raw_line:
+                return
+            truncated = len(raw_line) > FILTER_MAX_LINE_CHARS
+            if truncated and not raw_line.endswith("\n"):
+                while raw_line and not raw_line.endswith("\n"):
+                    raw_line = stream.readline(FILTER_MAX_LINE_CHARS + 1)
+                    if not raw_line:
+                        break
+            yield raw_line[:FILTER_MAX_LINE_CHARS], truncated
+
+    def write_filtered_raw_line(self, handle: IO[bytes], text: str, line_open: bool) -> bool:
+        return self.write_filtered_line(handle, text.rstrip("\r\n"), line_open)
+
+    def write_filtered_truncation_notice(self, handle: IO[bytes], line_open: bool) -> bool:
+        return self.write_filtered_line(
+            handle,
+            f"[catchball] truncated tool output line after {FILTER_MAX_LINE_CHARS} chars",
+            line_open,
+        )
+
+    def write_filtered_tool_error(self, handle: IO[bytes], text: str, line_open: bool) -> bool:
+        clean_text = text.strip()
+        if not clean_text:
+            return line_open
+        return self.write_filtered_line(handle, f"{ROLE_TOOL_ERROR_MARKER} {clean_text}", line_open)
+
+    def raw_json_mode_line_is_tool_error(self, tool_name: str, raw_line: str, *, saw_activity: bool = False) -> bool:
+        if tool_name != "copilot" or saw_activity:
+            return False
+        return bool(COPILOT_RAW_TOOL_ERROR_LINE_RE.match(raw_line.strip()))
 
     def _claude_stream_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
         line_open = False
+        if proc.stdout is None:
+            return
         with output_file.open("ab") as f:
-            for raw_line in proc.stdout:
+            for raw_line, truncated in self.iter_capped_output_lines(proc.stdout):
                 line = raw_line.strip()
                 if not line:
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 try:
                     event = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
+                    if self.raw_json_mode_line_is_tool_error("claude", raw_line):
+                        line_open = self.write_filtered_tool_error(f, raw_line, line_open)
+                    line_open = self.write_filtered_raw_line(f, raw_line, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 text = self.claude_event_text(event)
                 if text:
                     line_open = self.write_filtered_chunk(f, text, line_open)
+                if truncated:
+                    line_open = self.write_filtered_truncation_notice(f, line_open)
             self.write_filtered_break(f, line_open)
 
     def _codex_exec_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
         line_open = False
+        if proc.stdout is None:
+            return
         with output_file.open("ab") as f:
-            for raw_line in proc.stdout:
+            for raw_line, truncated in self.iter_capped_output_lines(proc.stdout):
                 line = raw_line.strip()
                 if not line:
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 try:
                     event = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
+                    if self.raw_json_mode_line_is_tool_error("codex", raw_line):
+                        line_open = self.write_filtered_tool_error(f, raw_line, line_open)
+                    line_open = self.write_filtered_raw_line(f, raw_line, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 text = self.codex_event_text(event)
                 if text:
+                    if str(event.get("type", "")) == "error":
+                        line_open = self.write_filtered_tool_error(f, text, line_open)
                     line_open = self.write_filtered_line(f, text, line_open)
+                if truncated:
+                    line_open = self.write_filtered_truncation_notice(f, line_open)
             self.write_filtered_break(f, line_open)
 
     def _copilot_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
         streamed_message_ids: set[str] = set()
         stream_kind = ""
         stream_id = ""
+        saw_activity = False
         line_open = False
+        if proc.stdout is None:
+            return
         with output_file.open("ab") as f:
-            for raw_line in proc.stdout:
+            for raw_line, truncated in self.iter_capped_output_lines(proc.stdout):
                 line = raw_line.strip()
                 if not line:
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 try:
                     event = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
+                    if self.raw_json_mode_line_is_tool_error("copilot", raw_line, saw_activity=saw_activity):
+                        line_open = self.write_filtered_tool_error(f, raw_line, line_open)
+                    line_open = self.write_filtered_raw_line(f, raw_line, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 data = event.get("data")
                 event_type = str(event.get("type", ""))
+                if event_type == "error":
+                    error_text = self.copilot_event_error_text(event)
+                    if error_text:
+                        line_open = self.write_filtered_tool_error(f, error_text, line_open)
+                        line_open = self.write_filtered_line(f, error_text, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
+                    continue
                 if event_type == "assistant.reasoning_delta" and isinstance(data, dict):
-                    reasoning_id = str(data.get("reasoningId", ""))
-                    delta_text = str(data.get("deltaContent", ""))
-                    if not delta_text:
+                    reasoning_id = data.get("reasoningId")
+                    delta_text = data.get("deltaContent")
+                    reasoning_id_text = reasoning_id if isinstance(reasoning_id, str) else ""
+                    if not isinstance(delta_text, str) or not delta_text:
                         continue
-                    if stream_kind != "reasoning" or stream_id != reasoning_id:
+                    saw_activity = True
+                    if stream_kind != "reasoning" or stream_id != reasoning_id_text:
                         line_open = self.write_filtered_break(f, line_open)
                         line_open = self.write_filtered_chunk(f, "[reasoning] ", line_open)
                     stream_kind = "reasoning"
-                    stream_id = reasoning_id
+                    stream_id = reasoning_id_text
                     line_open = self.write_filtered_chunk(f, delta_text, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 if event_type == "assistant.message_delta" and isinstance(data, dict):
-                    message_id = str(data.get("messageId", ""))
-                    delta_text = str(data.get("deltaContent", ""))
-                    if not delta_text:
+                    message_id = data.get("messageId")
+                    delta_text = data.get("deltaContent")
+                    message_id_text = message_id if isinstance(message_id, str) else ""
+                    if not isinstance(delta_text, str) or not delta_text:
                         continue
-                    if stream_kind != "message" or stream_id != message_id:
+                    saw_activity = True
+                    if stream_kind != "message" or stream_id != message_id_text:
                         line_open = self.write_filtered_break(f, line_open)
                     stream_kind = "message"
-                    stream_id = message_id
-                    if message_id:
-                        streamed_message_ids.add(message_id)
+                    stream_id = message_id_text
+                    if message_id_text:
+                        streamed_message_ids.add(message_id_text)
                     line_open = self.write_filtered_chunk(f, delta_text, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 if event_type == "assistant.message" and isinstance(data, dict):
                     stream_kind = ""
                     stream_id = ""
-                    message_id = str(data.get("messageId", ""))
-                    message_text = str(data.get("content", ""))
-                    if message_text and message_id not in streamed_message_ids:
+                    message_id = data.get("messageId")
+                    message_text = data.get("content")
+                    message_id_text = message_id if isinstance(message_id, str) else ""
+                    if isinstance(message_text, str) and message_text and message_id_text not in streamed_message_ids:
+                        saw_activity = True
                         line_open = self.write_filtered_line(f, message_text, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 if event_type == "tool.execution_start" and isinstance(data, dict):
                     stream_kind = ""
                     stream_id = ""
-                    tool_name = str(data.get("toolName", "")).strip()
-                    if tool_name:
-                        line_open = self.write_filtered_line(f, f"[tool] {tool_name}", line_open)
+                    tool_name = data.get("toolName")
+                    tool_name_text = tool_name.strip() if isinstance(tool_name, str) else ""
+                    if tool_name_text:
+                        saw_activity = True
+                        line_open = self.write_filtered_line(f, f"[tool] {tool_name_text}", line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 if event_type == "assistant.turn_end":
                     stream_kind = ""
                     stream_id = ""
                     line_open = self.write_filtered_break(f, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
+                    continue
+                if truncated:
+                    line_open = self.write_filtered_truncation_notice(f, line_open)
             self.write_filtered_break(f, line_open)
 
     def _opencode_json_filter_thread(self, proc: subprocess.Popen, output_file: Path) -> None:
         line_open = False
+        if proc.stdout is None:
+            return
         with output_file.open("ab") as f:
-            for raw_line in proc.stdout:
+            for raw_line, truncated in self.iter_capped_output_lines(proc.stdout):
                 line = raw_line.strip()
                 if not line:
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 try:
                     event = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
+                    if self.raw_json_mode_line_is_tool_error("opencode", raw_line):
+                        line_open = self.write_filtered_tool_error(f, raw_line, line_open)
+                    line_open = self.write_filtered_raw_line(f, raw_line, line_open)
+                    if truncated:
+                        line_open = self.write_filtered_truncation_notice(f, line_open)
                     continue
                 text = self.opencode_event_text(event)
                 if text:
+                    if str(event.get("type", "")) == "error":
+                        line_open = self.write_filtered_tool_error(f, text, line_open)
                     line_open = self.write_filtered_line(f, text, line_open)
+                if truncated:
+                    line_open = self.write_filtered_truncation_notice(f, line_open)
             self.write_filtered_break(f, line_open)
 
     def write_filtered_chunk(self, handle: IO[bytes], text: str, line_open: bool) -> bool:
@@ -1424,6 +1852,18 @@ class CatchballRunner:
                 return message
         return str(error.get("name", "")).strip()
 
+    def copilot_event_error_text(self, event: dict[str, object]) -> str:
+        data = event.get("data")
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error") or ""
+            if isinstance(message, str):
+                return message.strip()
+            if isinstance(message, dict):
+                inner_message = str(message.get("message", "")).strip()
+                if inner_message:
+                    return inner_message
+        return str(event.get("message", "")).strip()
+
     def render_tool_command(self, role_name: str, role: RoleSettings, prompt: str) -> list[str]:
         tool_config = TOOLS[role.tool]
         resolved_values = {
@@ -1439,7 +1879,7 @@ class CatchballRunner:
         output_args: list[str] = []
         for token in parts[1:]:
             if token == "{{prompt}}":
-                output_args.append(prompt)
+                output_args.append("-" if tool_config.prompt_via_stdin else prompt)
             elif token == "{{extra}}":
                 output_args.extend(role.extra_args)
             elif token == "{{preset}}":
@@ -1617,21 +2057,30 @@ class CatchballRunner:
         return parts[0]
 
     def resolve_supported_value(self, kind: str, value: str, supported_values: Sequence[str]) -> str:
-        normalized_value = normalize_role_value(kind, value)
+        normalized_value = normalize_choice_value(kind, value)
         if not normalized_value:
             return ""
         for supported_value in supported_values:
             if kind == "model" and supported_value == "provider/model" and "/" in normalized_value:
                 return value.strip()
-            if normalize_role_value(kind, supported_value) == normalized_value:
+            if normalize_choice_value(kind, supported_value) == normalized_value:
                 return supported_value
+        if kind == "model":
+            return value.strip()
         return ""
 
     def prepare_launch_command(self, binary_path: str, args: list[str]) -> list[str]:
         if os.name == "nt" and Path(binary_path).suffix.lower() in WINDOWS_BATCH_SUFFIXES:
-            normalized_args = [arg.replace("\r\n", "\n").replace("\n", " ") for arg in args]
-            return [binary_path, *normalized_args]
+            comspec = self.env.get("COMSPEC") or os.environ.get("COMSPEC") or "cmd.exe"
+            command = " ".join([self.quote_windows_batch_arg(binary_path), *(self.quote_windows_batch_arg(arg) for arg in args)])
+            return [comspec, "/d", "/v:off", "/s", "/c", command]
         return [binary_path, *args]
+
+    def quote_windows_batch_arg(self, value: str) -> str:
+        rendered = subprocess.list2cmdline([value]).replace("%", "%%")
+        if rendered == value and any(char.isspace() or char in WINDOWS_CMD_METACHARS for char in value):
+            return f'"{rendered}"'
+        return rendered
 
     def lock_file_value(self, lock_path: Path, key_name: str) -> str:
         if not lock_path.is_file():
@@ -1871,14 +2320,17 @@ class CatchballRunner:
     def display_task_state_path(self, path: Path | None) -> str:
         if path is None:
             return "None"
-        try:
-            relative_path = path.relative_to(self.settings.tasks_dir)
-        except ValueError:
-            return self.display_artifact_path(path)
-        relative_text = str(relative_path)
-        if not relative_path.parts or relative_text == ".":
-            return "<tasks-dir>"
-        return f"<tasks-dir>{os.sep}{relative_text}"
+        if self.state_dir is not None:
+            runs_root = self.state_dir.parent
+            try:
+                relative_path = path.relative_to(runs_root)
+            except ValueError:
+                return self.display_artifact_path(path)
+            relative_text = str(relative_path)
+            if not relative_path.parts or relative_text == ".":
+                return "<runs-root>"
+            return f"<runs-root>{os.sep}{relative_text}"
+        return self.display_artifact_path(path)
 
     def choose_console_color(self) -> bool:
         color_mode = self.env.get("CATCHBALL_COLOR", "").strip().lower()
@@ -1910,6 +2362,27 @@ class CatchballRunner:
         if not callable(is_tty) or not is_tty():
             return False
         return self.env.get("TERM", "").lower() != "dumb"
+
+    def live_status_max_width(self) -> int:
+        columns_text = self.env.get("COLUMNS", "").strip()
+        if columns_text.isdigit():
+            columns = int(columns_text)
+        else:
+            try:
+                columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+            except OSError:
+                columns = 80
+        return max(0, columns - 1)
+
+    def fit_live_status_text(self, text: str) -> str:
+        max_width = self.live_status_max_width()
+        if max_width <= 0:
+            return ""
+        if len(text) <= max_width:
+            return text
+        if max_width <= 3:
+            return text[:max_width]
+        return text[: max_width - 3] + "..."
 
     def colorize(self, style_name: str, text: str) -> str:
         if not self.console_color:
@@ -1951,8 +2424,13 @@ class CatchballRunner:
         self.live_status_thread = None
 
     def write_live_status_locked(self, message: str) -> None:
-        rendered = f"{self.spinner_frame()} {message}"
+        rendered = self.fit_live_status_text(f"{self.spinner_frame()} {message}")
+        if not rendered:
+            return
+        max_width = self.live_status_max_width()
         self.live_status_width = max(self.live_status_width, len(rendered))
+        if max_width > 0:
+            self.live_status_width = min(self.live_status_width, max_width)
         self.stdout.write("\r" + rendered.ljust(self.live_status_width))
         self.stdout.flush()
 
@@ -2040,13 +2518,16 @@ class CatchballRunner:
         return (stats.st_size, int(stats.st_mtime))
 
     def sanitize_name(self, value: str) -> str:
+        original_value = value
         value = value.replace("\\", "/").replace("/", "-")
         value = re.sub(r"\s+", "-", value)
         value = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
         value = re.sub(r"^-+", "", value)
         value = re.sub(r"-+$", "", value)
         value = re.sub(r"-+", "-", value)
-        return value
+        if value:
+            return value
+        return hashlib.sha1(original_value.encode("utf-8")).hexdigest()[:12]
 
     def make_absolute_path(self, path: Path) -> Path:
         if path.is_absolute():
@@ -2067,8 +2548,19 @@ class CatchballRunner:
 
     def _git(self, *args: str) -> subprocess.CompletedProcess | None:
         try:
-            return subprocess.run(["git", *args], cwd=self.root_dir, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+            return subprocess.run(
+                ["git", *args],
+                cwd=self.root_dir,
+                env=self.env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+            )
         except FileNotFoundError:
+            return None
+        except subprocess.TimeoutExpired:
             return None
 
     def is_inside_git_worktree(self) -> bool:
@@ -2107,6 +2599,8 @@ class CatchballRunner:
 
 
 def install_signal_handlers(runner: CatchballRunner) -> Callable[[], None]:
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
     previous_handlers: dict[int, object] = {}
 
     def handler(signum: int, frame: object) -> None:

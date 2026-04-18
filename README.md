@@ -68,7 +68,7 @@ Claude Code, OpenAI Codex, GitHub Copilot, and OpenCode. You can use one for eve
 Plain markdown. Describe what you want built, fixed, or changed. catchball attaches the task file path to the worker as the prompt. One clear goal per file works best.
 
 ### How does the review loop work?
-Worker runs first, then the reviewer. If the reviewer finds nothing to flag, the task passes. If it writes issues to a `.review` file, the fixer (or worker) gets a fix round. This repeats up to `--review-passes` times (default 3).
+Worker runs first, then the reviewer. If the reviewer finds nothing to flag, the task passes. If it writes issues to a `.review` file, the fixer (or worker) gets a fix round. The fixer can either fix the issues or write a `.response` file for any issues it is intentionally pushing back on. Before the next review pass, catchball archives the active `.review` and `.response` together for that round, then the reviewer reads both before deciding what still stands. This repeats up to `--review-passes` times (default 3).
 
 ### How do I pick a model?
 Use `--worker-model`, `--reviewer-model`, or `--fixer-model`:
@@ -114,6 +114,8 @@ catchball --worker opencode --fixer codex --reviewer claude
 
 If `FIXER.md` exists at repo root, catchball picks it up. Otherwise it uses `WORKER.md` as guidance.
 
+Fix rounds keep reviewer and fixer ownership separate: reviewers write `.review` files, and fixers write `.response` files only when they are intentionally not fixing a flagged issue in that round.
+
 ### Can I run catchball from outside the target repo?
 Yes, but set the `--project-root`:
 
@@ -142,11 +144,17 @@ Use `--review-passes`:
 catchball --worker claude --reviewer codex --review-passes 5
 ```
 
+`--retries` is supported as a compatibility alias for extra fix/review loops, but it cannot be combined with `--review-passes`.
+
 ### What happens when a task fails to clean after exhausing the review passes?
 catchball marks it with a `.failed` sidecar and stops the whole opertion. Use `--continue-despite-failures` to keep moving on to next tasks instead.
 
 ### Can I rerun a task list?
-Tasks with a `.done` marker in `catchball-state/` are skipped on reruns. Failed tasks get `.failed` instead and they are retried again next time.
+Tasks with a `.done` marker under `catchball-runs/state/` are skipped on reruns. Failed tasks get `.failed` instead and they are retried again next time.
+
+Each tasks directory gets its own namespaced folder under that shared state tree, so rerun state stays persistent without mixing different task lists together.
+
+The namespace is intentionally flat and readable, based on the tail of the tasks path. For example, `.samples/sample-tasks/js-click-game` becomes `sample-tasks--js-click-game` under `catchball-runs/state/`.
 
 For a completely fresh start, use `--reset-state` or delete the state folder:
 
@@ -160,6 +168,8 @@ Use `--worker-arg`, `--fixer-arg`, or `--reviewer-arg`:
 ```bash
 catchball --worker claude --reviewer codex --worker-arg "--dangerously-skip-permissions"
 ```
+
+Each passthrough flag consumes exactly one following token, even if that token begins with `-` or `--`. The `--worker-arg=value` form also works. Repeat the flag to pass multiple arguments.
 
 ### Can I add a delay between phases?
 Yes. `--phase-delay` now defaults to `3`, and the same delay is also applied between completed tasks. Set it to `0` if you want to disable the pause entirely:
@@ -177,10 +187,12 @@ catchball is strictly sequential inside one task list. If some tasks are indepen
 catchball wants a clean git worktree before starting. This flag skips that check.
 
 ### What are these lock files?
-They live under `<tasks-dir>/catchball-state/` and prevent two runs from working the same task. Stale locks are cleared automatically.
+They live under the shared `catchball-runs/state/` tree and prevent two runs from working the same task. Stale locks are cleared automatically.
 
 ### Where do the logs go?
-Under `<active-root>/catchball-runs/<timestamp>/` — each run gets a log file, worker output, reviewer output, and reviews. Use `--state-dir` to override.
+Under `<active-root>/catchball-runs/<timestamp>/` — each run gets a log file, worker output, reviewer output, reviews, and fixer responses. Use `--state-dir` to override.
+
+Run directories use an unambiguous UTC timestamp format.
 
 ### Is this another Ralph Wiggum?
 Same spirit, more structure. catchball is a role-based multi-agent coding loop with fixed implement, review, and fix stages.

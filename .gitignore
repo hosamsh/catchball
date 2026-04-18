@@ -6,4 +6,6 @@ catchball-runs/
 __pycache__/
 *.pyc
 .venv/
+.vscode/
+.samples/playground/js-click-game/
 *.egg-info/

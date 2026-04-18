@@ -395,7 +395,7 @@ class CatchballRunner:
         self.run_results_dir: Path | None = None
         self.run_review_outputs_dir: Path | None = None
         self.reviews_dir: Path | None = None
-        self.responses_dir: Path | None = None
+        self.pushbacks_dir: Path | None = None
         self.tasks: list[Path] = []
         self.start_index = 0
         self.current_lock_file: Path | None = None
@@ -486,12 +486,12 @@ class CatchballRunner:
         self.run_results_dir = self.state_dir / "worker-output"
         self.run_review_outputs_dir = self.state_dir / "reviewer-output"
         self.reviews_dir = self.state_dir / "reviews"
-        self.responses_dir = self.state_dir / "responses"
+        self.pushbacks_dir = self.state_dir / "pushbacks"
         self.ensure_parent_dir(self.run_log)
         self.run_results_dir.mkdir(parents=True, exist_ok=True)
         self.run_review_outputs_dir.mkdir(parents=True, exist_ok=True)
         self.reviews_dir.mkdir(parents=True, exist_ok=True)
-        self.responses_dir.mkdir(parents=True, exist_ok=True)
+        self.pushbacks_dir.mkdir(parents=True, exist_ok=True)
 
     def default_task_state_dir(self) -> Path:
         assert self.state_dir is not None
@@ -611,7 +611,7 @@ class CatchballRunner:
         assert self.state_dir is not None
         assert self.task_state_dir is not None
         assert self.reviews_dir is not None
-        assert self.responses_dir is not None
+        assert self.pushbacks_dir is not None
         assert self.run_log is not None
         self.emit(
             "catchball | worker: "
@@ -640,7 +640,7 @@ class CatchballRunner:
         self.emit(f"catchball | worker output: {self.display_run_path(self.run_results_dir)}")
         self.emit(f"catchball | reviewer output: {self.display_run_path(self.run_review_outputs_dir)}")
         self.emit(f"catchball | reviews: {self.display_run_path(self.reviews_dir)}")
-        self.emit(f"catchball | responses: {self.display_run_path(self.responses_dir)}")
+        self.emit(f"catchball | pushbacks: {self.display_run_path(self.pushbacks_dir)}")
         self.emit(f"catchball | run log: {self.display_run_path(self.run_log)}")
         for role_name in self.configured_role_names():
             for label, instructions_file in self.role_instruction_entries(role_name):
@@ -671,13 +671,13 @@ class CatchballRunner:
         assert self.run_results_dir is not None
         assert self.run_review_outputs_dir is not None
         assert self.reviews_dir is not None
-        assert self.responses_dir is not None
+        assert self.pushbacks_dir is not None
         pending_tasks = self.tasks[self.start_index : self.end_index]
         for task_index, task_file in enumerate(pending_tasks):
             rel_path = self.task_rel(task_file)
             key = self.task_key(task_file)
             active_review_file = self.task_sidecar(task_file, ".review", base_dir=self.reviews_dir)
-            active_response_file = self.task_sidecar(task_file, ".response", base_dir=self.responses_dir)
+            active_pushback_file = self.task_sidecar(task_file, ".pushback", base_dir=self.pushbacks_dir)
 
             if self.task_sidecar(task_file, ".done").is_file():
                 self.report(f"SKIP_DONE {rel_path}", "SKIP_DONE", rel_path)
@@ -698,9 +698,9 @@ class CatchballRunner:
             pre_task_dirty: frozenset[str] = self.git_dirty_files()
             try:
                 self.ensure_parent_dir(active_review_file)
-                self.ensure_parent_dir(active_response_file)
+                self.ensure_parent_dir(active_pushback_file)
                 self.cleanup_empty_file(active_review_file)
-                self.cleanup_empty_file(active_response_file)
+                self.cleanup_empty_file(active_pushback_file)
                 implementation_round = 1
 
                 while True:
@@ -715,7 +715,7 @@ class CatchballRunner:
                         implementation_role,
                         task_file,
                         active_review_file if has_review else None,
-                        active_response_file if has_review else None,
+                        active_pushback_file if has_review else None,
                         diff_stat=self.git_diff_stat(pre_task_dirty) if has_review else "",
                     )
                     event = "RUN_FIX" if has_review else "RUN"
@@ -746,13 +746,13 @@ class CatchballRunner:
                         break
 
                     previous_review_file: Path | None = None
-                    previous_response_file: Path | None = None
+                    previous_pushback_file: Path | None = None
                     if self.active_review_exists(active_review_file):
-                        previous_review_file, previous_response_file = self.archive_active_round_feedback(task_file)
+                        previous_review_file, previous_pushback_file = self.archive_active_round_feedback(task_file)
                         if previous_review_file is not None:
                             detail = f"review={previous_review_file}"
-                            if previous_response_file is not None:
-                                detail += f" response={previous_response_file}"
+                            if previous_pushback_file is not None:
+                                detail += f" pushback={previous_pushback_file}"
                             self.log_run("REVIEW_ARCHIVED", rel_path, detail)
 
                     stage_durations["delay"] += self.pause_before_transition(rel_path, implementation_role, "reviewer")
@@ -760,13 +760,13 @@ class CatchballRunner:
                     review_pass = self.next_review_pass(task_file)
                     review_output_file = self.run_review_outputs_dir / f"{key}.review-{review_pass}.log"
                     active_review_file.unlink(missing_ok=True)
-                    active_response_file.unlink(missing_ok=True)
+                    active_pushback_file.unlink(missing_ok=True)
                     reviewer_prompt = self.reviewer_prompt_text(
                         task_file,
                         active_review_file,
                         review_pass,
                         previous_review_file,
-                        previous_response_file,
+                        previous_pushback_file,
                         diff_stat=self.git_diff_stat(pre_task_dirty),
                     )
                     self.report(
@@ -949,6 +949,7 @@ class CatchballRunner:
         last_output_state = self.output_state(output_file)
         last_process_state = self.process_tree_signature(process.pid)
         self.log_run("ROLE_START", task_label, f"role={role_name} pid={process.pid} file={output_file}")
+        self.log_run("ROLE_PROMPT", task_label, f"role={role_name} prompt={prompt!r}")
         idle_grace_used = False
         self.emit_role_health_status(role_name, "starting", started_at, 0, last_output_state[0])
 
@@ -1038,7 +1039,7 @@ class CatchballRunner:
         role_name: str,
         task: Path,
         review: Path | None,
-        response: Path | None,
+        pushback: Path | None,
         diff_stat: str = "",
     ) -> str:
         if review is not None and self.file_has_content(review):
@@ -1047,25 +1048,25 @@ class CatchballRunner:
                 "Start by reading that file and fix every issue listed there.",
                 f"Use {task} only as the source of truth for the intended outcome.",
                 "Do not re-implement the task from scratch unless a review issue requires it.",
-                "If you intentionally leave any review issue unresolved, record that pushback in a response file for the reviewer.",
+                "If you intentionally leave any review issue unresolved, record that pushback in a pushback file for the reviewer.",
                 "",
             ]
-            if response is not None:
-                if self.file_has_content(response):
+            if pushback is not None:
+                if self.file_has_content(pushback):
                     lines.extend(
                         (
-                            f"An active fixer response already exists at {response}.",
-                            "Read it first, then replace it with the current unresolved-issue response for this round.",
-                            "If every review issue is now addressed, remove that response file or leave it absent.",
+                            f"An active fixer pushback already exists at {pushback}.",
+                            "Read it first, then replace it with the current unresolved-issue pushback for this round.",
+                            "If every review issue is now addressed, remove that pushback file or leave it absent.",
                             "",
                         )
                     )
                 lines.extend(
                     (
-                        f"If any issue remains disputed after your changes, create exactly one non-empty file at {response}.",
+                        f"If any issue remains disputed after your changes, create exactly one non-empty file at {pushback}.",
                         "Reference the reviewer issue IDs when present. If there are no explicit IDs yet, quote enough of the issue text to make the mapping unambiguous.",
                         "Only include issues you are intentionally not fixing in this round, together with the reason for each one.",
-                        f"Write only to that file under {self.responses_dir}.",
+                        f"Write only to that file under {self.pushbacks_dir}.",
                         "",
                     )
                 )
@@ -1084,19 +1085,17 @@ class CatchballRunner:
         review: Path,
         review_pass: int,
         previous_review: Path | None,
-        previous_response: Path | None,
+        previous_pushback: Path | None,
         diff_stat: str = "",
     ) -> str:
         lines = [
             f"Review the implementation against the task in {task}.",
             "",
-            "Review only. Do not fix code.",
-            "Do not conclude clean while a concrete correctness or scope issue remains unresolved.",
-            f"If you identify a concrete correctness or scope issue, write it to {review}.",
-            f"Only {review} may be written in this run.",
-            f"Your transcript is not read. Only the contents of {review} are read; if you do not create it, the result is PASS.",
-            f"If the code is clean, do not create {review} and stop.",
-            "If you write a review file, give each issue a stable ID such as R1, R2, R3.",
+            "Do not modify application code.",
+            "Do not change the task file.",
+            f"If the implementation is clean, do not create {review}.",
+            f"If there are issues, create exactly one non-empty file at {review} and list only the issues that must be fixed.",
+            f"Write only to that file under {self.reviews_dir}.",
             f"This is review pass {review_pass}.",
         ]
         if diff_stat:
@@ -1107,14 +1106,14 @@ class CatchballRunner:
             lines.extend(
                 (
                     "",
-                    f"The review issues from the previous round are in {previous_review}.",
-                    "Check whether each one was addressed before writing a new review.",
+                    f"The previous resolved review comments are in {previous_review}.",
+                    "Check whether they were addressed before writing a new review.",
                 )
             )
-        if previous_response is not None:
+        if previous_pushback is not None:
             lines.extend(
                 (
-                    f"The fixer response for that round is in {previous_response}.",
+                    f"The fixer pushback for that round is in {previous_pushback}.",
                     "Read it before deciding whether any previous issue still stands.",
                     "If you keep or restate an issue after pushback, keep the same issue ID when practical and say briefly why the pushback was not accepted.",
                 )
@@ -1146,7 +1145,7 @@ class CatchballRunner:
         self.cleanup_empty_file(file_path)
         return self.file_has_content(file_path)
 
-    def active_response_exists(self, file_path: Path) -> bool:
+    def active_pushback_exists(self, file_path: Path) -> bool:
         self.cleanup_empty_file(file_path)
         return self.file_has_content(file_path)
 
@@ -1214,24 +1213,24 @@ class CatchballRunner:
         active_review.replace(archived_review)
         return archived_review
 
-    def archive_active_response(self, task: Path, archive_index: int) -> Path | None:
-        assert self.responses_dir is not None
-        active_response = self.task_sidecar(task, ".response", base_dir=self.responses_dir)
-        if not self.file_has_content(active_response):
+    def archive_active_pushback(self, task: Path, archive_index: int) -> Path | None:
+        assert self.pushbacks_dir is not None
+        active_pushback = self.task_sidecar(task, ".pushback", base_dir=self.pushbacks_dir)
+        if not self.file_has_content(active_pushback):
             return None
-        archived_response = Path(
-            f"{self.task_sidecar(task, '.response.done', base_dir=self.responses_dir)}.{archive_index}"
+        archived_pushback = Path(
+            f"{self.task_sidecar(task, '.pushback.done', base_dir=self.pushbacks_dir)}.{archive_index}"
         )
-        self.ensure_parent_dir(archived_response)
-        active_response.replace(archived_response)
-        return archived_response
+        self.ensure_parent_dir(archived_pushback)
+        active_pushback.replace(archived_pushback)
+        return archived_pushback
 
     def archive_active_round_feedback(self, task: Path) -> tuple[Path | None, Path | None]:
         assert self.reviews_dir is not None
         review_archive_index = self.next_review_pass(task)
         previous_review = self.archive_active_review(task)
-        previous_response = self.archive_active_response(task, review_archive_index)
-        return previous_review, previous_response
+        previous_pushback = self.archive_active_pushback(task, review_archive_index)
+        return previous_review, previous_pushback
 
     def log_run(self, event: str, task: str, message: str = "") -> None:
         if self.run_log is None:
@@ -2073,7 +2072,8 @@ class CatchballRunner:
     def prepare_launch_command(self, binary_path: str, args: list[str]) -> list[str]:
         if os.name == "nt" and Path(binary_path).suffix.lower() in WINDOWS_BATCH_SUFFIXES:
             comspec = self.env.get("COMSPEC") or os.environ.get("COMSPEC") or "cmd.exe"
-            command = " ".join([self.quote_windows_batch_arg(binary_path), *(self.quote_windows_batch_arg(arg) for arg in args)])
+            normalized_args = [arg.replace("\r\n", "\n").replace("\n", " ") for arg in args]
+            command = " ".join([self.quote_windows_batch_arg(binary_path), *(self.quote_windows_batch_arg(arg) for arg in normalized_args)])
             return [comspec, "/d", "/v:off", "/s", "/c", command]
         return [binary_path, *args]
 

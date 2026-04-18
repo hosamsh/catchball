@@ -367,7 +367,7 @@ class CatchballTests(unittest.TestCase):
             self.assertIn("[catchball-tool-error]", contents)
             self.assertIn('Model "gpt-5.3-Codex" from --model flag is not available.', contents)
 
-    def test_archive_active_round_feedback_pairs_review_and_response(self) -> None:
+    def test_archive_active_round_feedback_pairs_review_and_pushback(self) -> None:
         with TemporaryDirectory() as temp_dir_text:
             temp_dir = Path(temp_dir_text)
             tasks_dir = temp_dir / "tasks"
@@ -388,26 +388,26 @@ class CatchballTests(unittest.TestCase):
             runner.initialize_state()
 
             assert runner.reviews_dir is not None
-            assert runner.responses_dir is not None
+            assert runner.pushbacks_dir is not None
             active_review = runner.task_sidecar(task_file, ".review", base_dir=runner.reviews_dir)
-            active_response = runner.task_sidecar(task_file, ".response", base_dir=runner.responses_dir)
+            active_pushback = runner.task_sidecar(task_file, ".pushback", base_dir=runner.pushbacks_dir)
             active_review.write_text("R1: still broken\n", encoding="utf-8")
-            active_response.write_text("R1: expected behavior because ...\n", encoding="utf-8")
+            active_pushback.write_text("R1: expected behavior because ...\n", encoding="utf-8")
 
-            archived_review, archived_response = runner.archive_active_round_feedback(task_file)
+            archived_review, archived_pushback = runner.archive_active_round_feedback(task_file)
 
             self.assertIsNotNone(archived_review)
-            self.assertIsNotNone(archived_response)
+            self.assertIsNotNone(archived_pushback)
             assert archived_review is not None
-            assert archived_response is not None
+            assert archived_pushback is not None
             self.assertEqual(archived_review.name, "010-task.md.review.done.1")
-            self.assertEqual(archived_response.name, "010-task.md.response.done.1")
+            self.assertEqual(archived_pushback.name, "010-task.md.pushback.done.1")
             self.assertFalse(active_review.exists())
-            self.assertFalse(active_response.exists())
+            self.assertFalse(active_pushback.exists())
             self.assertEqual(archived_review.read_text(encoding="utf-8"), "R1: still broken\n")
-            self.assertEqual(archived_response.read_text(encoding="utf-8"), "R1: expected behavior because ...\n")
+            self.assertEqual(archived_pushback.read_text(encoding="utf-8"), "R1: expected behavior because ...\n")
 
-    def test_implementation_prompt_text_includes_response_contract(self) -> None:
+    def test_implementation_prompt_text_includes_pushback_contract(self) -> None:
         with TemporaryDirectory() as temp_dir_text:
             temp_dir = Path(temp_dir_text)
             tasks_dir = temp_dir / "tasks"
@@ -428,25 +428,25 @@ class CatchballTests(unittest.TestCase):
             runner.initialize_state()
 
             assert runner.reviews_dir is not None
-            assert runner.responses_dir is not None
+            assert runner.pushbacks_dir is not None
             review_file = runner.task_sidecar(task_file, ".review", base_dir=runner.reviews_dir)
-            response_file = runner.task_sidecar(task_file, ".response", base_dir=runner.responses_dir)
+            pushback_file = runner.task_sidecar(task_file, ".pushback", base_dir=runner.pushbacks_dir)
             review_file.write_text("R1: still broken\n", encoding="utf-8")
-            response_file.write_text("R1: leaving as-is\n", encoding="utf-8")
+            pushback_file.write_text("R1: leaving as-is\n", encoding="utf-8")
 
             prompt = runner.implementation_prompt_text(
                 "fixer",
                 task_file,
                 review_file,
-                response_file,
+                pushback_file,
                 diff_stat="catchball.py | 3 +-",
             )
 
-            self.assertIn(str(response_file), prompt)
-            self.assertIn("replace it with the current unresolved-issue response for this round", prompt)
+            self.assertIn(str(pushback_file), prompt)
+            self.assertIn("replace it with the current unresolved-issue pushback for this round", prompt)
             self.assertIn("Only include issues you are intentionally not fixing in this round", prompt)
 
-    def test_reviewer_prompt_text_mentions_previous_response(self) -> None:
+    def test_reviewer_prompt_text_mentions_previous_pushback(self) -> None:
         with TemporaryDirectory() as temp_dir_text:
             temp_dir = Path(temp_dir_text)
             tasks_dir = temp_dir / "tasks"
@@ -467,33 +467,30 @@ class CatchballTests(unittest.TestCase):
             runner.initialize_state()
 
             assert runner.reviews_dir is not None
-            assert runner.responses_dir is not None
+            assert runner.pushbacks_dir is not None
             active_review = runner.task_sidecar(task_file, ".review", base_dir=runner.reviews_dir)
             previous_review = runner.task_sidecar(task_file, ".review.done.1", base_dir=runner.reviews_dir)
-            previous_response = runner.task_sidecar(task_file, ".response.done.1", base_dir=runner.responses_dir)
+            previous_pushback = runner.task_sidecar(task_file, ".pushback.done.1", base_dir=runner.pushbacks_dir)
 
             prompt = runner.reviewer_prompt_text(
                 task_file,
                 active_review,
                 2,
                 previous_review,
-                previous_response,
+                previous_pushback,
                 diff_stat="catchball.py | 2 ++",
             )
 
-            self.assertIn("Review only. Do not fix code.", prompt)
+            self.assertIn("Do not modify application code.", prompt)
+            self.assertIn("Do not change the task file.", prompt)
             self.assertIn(
-                "Do not conclude clean while a concrete correctness or scope issue remains unresolved.",
+                f"If there are issues, create exactly one non-empty file at {active_review}",
                 prompt,
             )
-            self.assertIn(
-                f"If you identify a concrete correctness or scope issue, write it to {active_review}.",
-                prompt,
-            )
-            self.assertIn(f"Only {active_review} may be written in this run.", prompt)
-            self.assertIn(f"If the code is clean, do not create {active_review} and stop.", prompt)
+            self.assertIn(f"Write only to that file under {runner.reviews_dir}.", prompt)
+            self.assertIn(f"If the implementation is clean, do not create {active_review}.", prompt)
             self.assertIn(str(previous_review), prompt)
-            self.assertIn(str(previous_response), prompt)
+            self.assertIn(str(previous_pushback), prompt)
             self.assertIn("keep the same issue ID when practical", prompt)
 
     @unittest.skipUnless(os.name == "nt", "Windows-specific batch wrapper behavior")

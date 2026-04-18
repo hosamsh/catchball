@@ -481,6 +481,17 @@ class CatchballTests(unittest.TestCase):
                 diff_stat="catchball.py | 2 ++",
             )
 
+            self.assertIn("Review only. Do not fix code.", prompt)
+            self.assertIn(
+                "Do not conclude clean while a concrete correctness or scope issue remains unresolved.",
+                prompt,
+            )
+            self.assertIn(
+                f"If you identify a concrete correctness or scope issue, write it to {active_review}.",
+                prompt,
+            )
+            self.assertIn(f"Only {active_review} may be written in this run.", prompt)
+            self.assertIn(f"If the code is clean, do not create {active_review} and stop.", prompt)
             self.assertIn(str(previous_review), prompt)
             self.assertIn(str(previous_response), prompt)
             self.assertIn("keep the same issue ID when practical", prompt)

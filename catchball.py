@@ -1090,12 +1090,13 @@ class CatchballRunner:
         lines = [
             f"Review the implementation against the task in {task}.",
             "",
-            "Do not modify application code.",
-            "Do not change the task file.",
-            f"If the implementation is clean, do not create {review}.",
-            f"If there are issues, create exactly one non-empty file at {review} and list only the issues that must be fixed.",
+            "Review only. Do not fix code.",
+            "Do not conclude clean while a concrete correctness or scope issue remains unresolved.",
+            f"If you identify a concrete correctness or scope issue, write it to {review}.",
+            f"Only {review} may be written in this run.",
+            f"Your transcript is not read. Only the contents of {review} are read; if you do not create it, the result is PASS.",
+            f"If the code is clean, do not create {review} and stop.",
             "If you write a review file, give each issue a stable ID such as R1, R2, R3.",
-            f"Write only to that file under {self.reviews_dir}.",
             f"This is review pass {review_pass}.",
         ]
         if diff_stat:

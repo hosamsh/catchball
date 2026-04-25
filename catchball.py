@@ -178,7 +178,7 @@ TOOLS: dict[str, ToolConfig] = {
     "codex": ToolConfig(
         spec=(
             "codex exec --json "
-            "[model:--model {value}:gpt-5.4|gpt-5.4-mini|gpt-5.3-codex|gpt-5.3-codex-spark|gpt-5.2|gpt-5.1-codex-mini] "
+            "[model:--model {value}:gpt-5.5|gpt-5.4|gpt-5.4-mini|gpt-5.3-codex|gpt-5.3-codex-spark|gpt-5.2|gpt-5.1-codex-mini] "
             "[effort:-c model_reasoning_effort={value}:low|medium|high|xhigh] "
             "{{preset}} {{extra}} -- {{prompt}}"
         ),
@@ -190,7 +190,7 @@ TOOLS: dict[str, ToolConfig] = {
     "copilot": ToolConfig(
         spec=(
             "copilot --output-format json --no-ask-user --allow-all "
-            "[model:--model {value}:gpt-5.4|gpt-5.3-Codex|gpt-5.2-Codex|gpt-5.2|gpt-5.1|gpt-5.4-mini|gpt-5-mini|gpt-4.1|claude-sonnet-4.6|claude-sonnet-4.5|claude-haiku-4.5|claude-opus-4.7|claude-opus-4.6|claude-opus-4.5|claude-sonnet-4] "
+            "[model:--model {value}:gpt-5.5|gpt-5.4|gpt-5.3-Codex|gpt-5.2-Codex|gpt-5.2|gpt-5.1|gpt-5.4-mini|gpt-5-mini|gpt-4.1|claude-sonnet-4.6|claude-sonnet-4.5|claude-haiku-4.5|claude-opus-4.7|claude-opus-4.6|claude-opus-4.5|claude-sonnet-4] "
             "[effort:--reasoning-effort {value}:low|medium|high|xhigh] "
             "{{preset}} {{extra}} -p {{prompt}}"
         ),
